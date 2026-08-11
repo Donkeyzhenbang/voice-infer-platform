@@ -373,11 +373,16 @@ session:
 
 ### Phase 2: 多进程单机多卡
 
+详见 [`docs/phase2-roadmap.md`](phase2-roadmap.md)。
+
 ```
-□ 进程分离（ProcessWorker 基类 + 二进制帧协议）
-□ CUDA_VISIBLE_DEVICES GPU 隔离
-□ gpu_alloc.yaml 配置
-□ 多会话 + Worker 池
+□ Phase 2a: Push 模式（会话绑定 Worker）
+  □ Worker 进程封装（Unix Socket + 二进制帧协议）
+  □ WorkerAllocator（Least Connections）
+  □ gpu_alloc.yaml 配置
+  □ 多用户并发验证
+
+□ Phase 2b: Pull 模式（按需，组件池 + 任务队列）
 ```
 
 ### Phase 3: 分布式（按需）
