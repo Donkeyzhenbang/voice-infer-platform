@@ -24,7 +24,7 @@ class VoiceSpec:
 
 class VoxCPM2TTS(TTSEngine):
     def __init__(self, model_path, device="cuda", sample_rate=16000,
-                 cfg_value=1.0, inference_timesteps=10, voices=None):
+                 cfg_value=2.0, inference_timesteps=10, voices=None):
         self.model_path = model_path
         self.device = device
         self.sample_rate = sample_rate
@@ -53,15 +53,13 @@ class VoxCPM2TTS(TTSEngine):
     async def synthesize(self, text, voice_id, session_id, turn_id=""):
         from voice_infer.common.audio import resample_audio
 
-        # 确定性：固定种子 + CUDA 确定性模式，消除音色随机漂移
+        # 固定种子 → 相同文本产生相同音色（不同文本因语义不同仍可能漂移）
         torch.manual_seed(42); torch.cuda.manual_seed_all(42)
-        torch.backends.cudnn.deterministic = True
-        torch.backends.cudnn.benchmark = False
 
-        # 不用任何参考音频——内置默认声音，干净无 artifacts
-        # cfg_value=1.0 不给无条件分支加权，音色最稳定（无参考时不宜 >1.5）
+        # 不用任何参考音频。cfg_value 控制文本语义引导强度，2.0 是官方推荐值，
+        # 越高文本跟随越紧、结构越稳定。无参考音频时不宜低于 2.0。
         gen = self._model.generate_streaming(
-            text=text, cfg_value=1.0,
+            text=text, cfg_value=self.cfg_value,
             inference_timesteps=self.inference_timesteps)
 
         cid = 0
