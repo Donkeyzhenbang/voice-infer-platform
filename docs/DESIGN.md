@@ -1,584 +1,389 @@
 # Voice Inference Platform — 设计文档
 
-> 分布式语音推理服务平台 · 从 VoxEMW 提炼核心数据流，重构为可横向扩展的微服务架构
+> 语音推理服务平台 · 渐进式架构：先跑通核心管线，再单机多卡分离，最后分布式
 
 ---
 
-## 一、设计目标
+## 一、设计理念
 
-| 目标 | VoxEMW 现状 | 本平台方案 |
-|------|-------------|------------|
-| **并发会话** | 1（`num_pipelines: 1`） | 无上限（按 GPU 线性扩展） |
-| **组件耦合** | 单进程紧耦合 | 独立微服务 + 消息队列解耦 |
-| **GPU 利用** | 全部组件同卡争抢 | 按组件粒度分配 GPU，独立扩缩 |
-| **故障隔离** | 单点故障全挂 | 单组件故障不影响其他，自动重试 |
-| **部署方式** | 手动脚本 | Docker Compose（单机）→ K8s（集群） |
-| **会话状态** | 进程内存 | Redis 集中存储 |
-| **模型更新** | 重启全服务 | 滚动更新 + 灰度发布 |
+**渐进式演进，不过度设计**：
+
+```
+Phase 1: 单进程直调          Phase 2: 多进程单机多卡        Phase 3: 多机分布式
+─────────────────────      ───────────────────────      ──────────────────
+                                                          
+  Orchestrator              Orchestrator (CPU)            Orchestrator ×N
+    │                         │ (Unix Socket)              API Gateway
+    ├─ vad()                  ├─ VAD Process    (CPU)      │ (Redis/NATS)
+    ├─ asr()                  ├─ ASR Process    (GPU:0)    ├─ VAD Pod ×N
+    ├─ llm()                  ├─ LLM Process    (CPU/API)  ├─ ASR Pod ×N
+    ├─ tts()                  ├─ TTS Process    (GPU:1)    ├─ LLM Pod ×N
+    └─ memory()               └─ Memory Process (CPU)      ├─ TTS Pod ×N
+                                                           └─ Avatar Pod ×N
+  目标: 跑通管线              目标: GPU 隔离 + 并行        目标: 弹性伸缩
+  开发周期: 1-2 天            开发周期: 2-3 天             开发周期: 按需
+```
+
+**核心原则**：
+1. **数据流先于中间件** — 先让声音能流转，再考虑用什么传
+2. **接口抽象，实现可换** — 组件间通过明确的协议通信，直调/进程间/队列三种实现可互换
+3. **单机多卡优先** — 一台 8×GPU 机器远比分布式集群常见，先解决这个
+4. **配置驱动** — 模型、参数、路由全部 YAML 管理，不硬编码
 
 ---
 
-## 二、整体架构
+## 二、核心数据流
 
-### 2.1 架构图
-
-```
-                          ┌─────────────────────────────────────┐
-                          │            API Gateway              │
-                          │  (Nginx/Traefik + WS Proxy)         │
-                          │           :80 / :443                │
-                          └──────────────┬──────────────────────┘
-                                         │
-                          ┌──────────────▼──────────────────────┐
-                          │          Orchestrator               │
-                          │   会话管理 · 人设 · 路由 · 降级       │
-                          │          (CPU, 可多副本)             │
-                          └──────┬───────┬───────┬──────────────┘
-                                 │       │       │
-                    ┌────────────┼───────┼───────┼────────────┐
-                    │            │  Redis / NATS              │
-                    │     ┌──────▼──┐ ┌──▼──────┐ ┌─────────┐ │
-                    │     │ Session │ │  Job Q  │ │  Pub/Sub │ │
-                    │     │  State  │ │(pipeline)│ │ (events) │ │
-                    │     └─────────┘ └─────────┘ └──────────┘ │
-                    └────────────┬───────┬───────┬──────────────┘
-                                 │       │       │
-          ┌──────────────────────┼───────┼───────┼──────────────────┐
-          │                      │       │       │                   │
-    ┌─────▼──────┐   ┌──────────▼──┐ ┌──▼──────┐ ┌─▼────────┐   ┌──▼──────┐
-    │ VAD Worker │   │  ASR Worker │ │   LLM   │ │   TTS    │   │ Avatar  │
-    │  (CPU)     │   │   (GPU)     │ │  Proxy  │ │  Worker  │   │ Worker  │
-    │            │   │             │ │  (API)  │ │  (GPU)   │   │ (GPU)   │
-    │ silero-vad │   │SenseVoiceS  │ │DeepSeek │ │ VoxCPM2  │   │ AVTR-1  │
-    │ ×N 副本     │   │ ×N 副本     │ │         │ │ ×N 副本   │   │ ×N 副本  │
-    └────────────┘   └─────────────┘ └─────────┘ └──────────┘   └─────────┘
-
-          ┌──────────────────────────────────────────────────────┐
-          │                  存储层                              │
-          │  ┌─────────┐  ┌──────────┐  ┌───────────────────┐   │
-          │  │  Redis  │  │  MinIO   │  │  Qdrant / Milvus  │   │
-          │  │ 状态/队列│  │ 音频/模型 │  │    向量库         │   │
-          │  └─────────┘  └──────────┘  └───────────────────┘   │
-          └──────────────────────────────────────────────────────┘
-```
-
-### 2.2 核心数据流
+这是整个平台的心脏，不管哪种部署形态，数据流不变：
 
 ```
-用户说话 (Browser)
-    │
-    │  WebSocket (binary PCM 16kHz mono int16)
-    ▼
-┌─────────────────────────────────────────────────────────────┐
-│ Orchestrator                                                 │
-│  1. 接收 PCM 音频帧                                          │
-│  2. 写入 Redis Stream: session:<id>:audio_in                 │
-│  3. 消费 Redis Stream: session:<id>:audio_out → 浏览器播放    │
-└─────────────────────────────────────────────────────────────┘
-    │
-    │  VAD Worker 消费 audio_in
-    ▼
-┌─────────────────────────────────────────────────────────────┐
-│ VAD Worker                                                   │
-│  - 读取: session:<id>:audio_in                               │
-│  - 处理: silero-vad 检测语音段                                │
-│  - 写入: session:<id>:speech_segments (完整语音段 PCM)         │
-└─────────────────────────────────────────────────────────────┘
-    │
-    │  ASR Worker 消费 speech_segments
-    ▼
-┌─────────────────────────────────────────────────────────────┐
-│ ASR Worker                                                   │
-│  - 读取: session:<id>:speech_segments                        │
-│  - 处理: SenseVoiceSmall 转写                                 │
-│  - 写入: Redis Pub/Sub → session:<id>:transcription           │
-│         (orchestrator 转发给浏览器显示转写文本)                │
-│  - 发布: session:<id>:user_text                              │
-└─────────────────────────────────────────────────────────────┘
-    │
-    │  LLM Proxy 消费 user_text
-    ▼
-┌─────────────────────────────────────────────────────────────┐
-│ LLM Proxy                                                    │
-│  - 读取: session:<id>:user_text + persona + memory_context    │
-│  - 处理: DeepSeek API 流式生成                                │
-│  - 写入: Redis Stream: session:<id>:llm_tokens (流式逐token)   │
-│         (orchestrator 转发给浏览器显示打字效果)                │
-│  - 发布: session:<id>:response_text (完整句子/段落)            │
-└─────────────────────────────────────────────────────────────┘
-    │
-    │  TTS Worker 消费 response_text
-    ▼
-┌─────────────────────────────────────────────────────────────┐
-│ TTS Worker                                                   │
-│  - 读取: session:<id>:response_text + persona voice_config    │
-│  - 处理: VoxCPM2 流式合成 (48kHz → 16kHz)                     │
-│  - 写入: Redis Stream: session:<id>:audio_chunks (PCM chunks) │
-│  - 可选: session:<id>:audio_chunks → Avatar Worker            │
-└─────────────────────────────────────────────────────────────┘
-    │
-    │  Orchestrator 消费 audio_chunks
-    ▼
-┌─────────────────────────────────────────────────────────────┐
-│ Orchestrator → Browser                                       │
-│  - WebSocket 推送 PCM 音频 → 浏览器播放                       │
-│  - 可选: 视频帧 → 浏览器渲染数字人                             │
-└─────────────────────────────────────────────────────────────┘
+用户说话
+  │
+  ▼
+┌──────────┐    ┌──────────┐    ┌──────────┐    ┌──────────┐    ┌──────────┐
+│   VAD    │───▶│   ASR    │───▶│   LLM    │───▶│   TTS    │───▶│  音频    │──▶ 浏览器播放
+│ (Silero) │    │(SenseVo- │    │(DeepSeek │    │ (VoxCPM2)│    │  输出    │
+│          │    │ iceSmall)│    │ v4-flash)│    │          │    │          │
+└──────────┘    └──────────┘    └──────────┘    └──────────┘    └──────────┘
+  │                │                │                │
+  │ 语音段         │ 转写文本        │ LLM 回复        │ PCM 音频
+  │ PCM float32    │                │ (句子级流式)     │ 16kHz int16
+  │                │                │                │
+  │                ▼                ▼                │
+  │           浏览器显示          浏览器打字           │
+  │           (实时字幕)          (逐句)              │
+  │                                                  │
+  └── 用户新语音 → VAD 检测 → 取消当前 epoch ────────┘
+       (打断: Pipeline 检测 _is_stale() 清理所有积压)
+```
+
+### WebSocket 双队列架构（实际实现）
+
+```
+浏览器 ←── WebSocket ──→ FastAPI Server
+                              │
+                    ┌─────────┴──────────┐
+                    │   receiver_task    │  ← 接收用户 PCM
+                    │        │           │
+                    │   pcm_queue        │  ← asyncio.Queue
+                    │        │           │
+                    │   turn_worker      │  ← Pipeline.process()
+                    │        │           │     (VAD→ASR→LLM→TTS)
+                    │   out_queue        │  ← asyncio.Queue
+                    │        │           │
+                    │   sender_task      │  ← 发送结果到浏览器
+                    └────────────────────┘
+
+打断流程:
+  用户按下"打断" → cancel() 
+    → epoch += 1
+    → 清空 pcm_queue
+    → turn_worker 检测 _is_stale() 停止所有生成
+```
+
+### 统一数据协议
+
+```python
+# src/voice_infer/common/schema.py
+
+@dataclass
+class AudioSegment:        # VAD → ASR
+    session_id: str
+    segment_id: str
+    audio: np.ndarray      # float32, 16kHz mono
+    start_ms: int
+    end_ms: int
+
+@dataclass  
+class Transcription:       # ASR → LLM + 前端
+    session_id: str
+    segment_id: str
+    text: str
+    emotion: str           # HAPPY/SAD/NEUTRAL/…
+    is_final: bool
+
+@dataclass
+class LLMResponse:         # LLM → TTS（句子级流式）
+    session_id: str
+    turn_id: str
+    text: str
+    is_final: bool
+
+@dataclass
+class AudioChunk:          # TTS → 浏览器（PCM 流式）
+    session_id: str
+    turn_id: str
+    chunk_id: int
+    audio: bytes           # int16 PCM, 16kHz mono
+    is_first: bool
+    is_final: bool
 ```
 
 ---
 
-## 三、技术选型
+## 三、Phase 1 架构：单进程直调 ✅ 已完成
 
-### 3.1 模型选型（沿用 VoxEMW 验证过的方案）
+```
+┌─────────────────────────────────────────────────────────┐
+│                    Orchestrator                          │
+│                   (单进程, :8000)                         │
+│                                                         │
+│  ┌─────────────────────────────────────────────────┐   │
+│  │              PipelineEngine                       │   │
+│  │  (纯 Python 函数调用，无网络开销)                   │   │
+│  │                                                   │   │
+│  │  双队列 WS 架构:                                    │   │
+│  │    receiver → pcm_queue → turn_worker              │   │
+│  │    turn_worker → out_queue → sender                │   │
+│  │                                                   │   │
+│  │  epoch 机制:                                       │   │
+│  │    每轮对话一个 epoch，打断时递增                    │   │
+│  │    VAD/ASR/LLM/TTS 每步检查 _is_stale()             │   │
+│  │    lock 只保护 VAD detect（避免整体超时）            │   │
+│  │                                                   │   │
+│  │  整轮语义:                                          │   │
+│  │    audio_start/end 只在整轮首尾各发一次              │   │
+│  │    中间 TTS chunk 均设 is_first=False               │   │
+│  └─────────────────────────────────────────────────┘   │
+│                                                         │
+│  ┌──────────┐  ┌──────────┐  ┌────────────────────┐    │
+│  │ WS Handler│  │ Session  │  │ Persona / Memory   │    │
+│  │ (FastAPI) │  │ Manager  │  │ / Knowledge         │    │
+│  └──────────┘  └──────────┘  └────────────────────┘    │
+└─────────────────────────────────────────────────────────┘
+         │
+         │ WebSocket (:8000)
+         ▼
+    ┌──────────┐
+    │  浏览器   │  ← iOS 风格白底蓝泡，录音/播放/打断
+    └──────────┘
+```
 
-| 组件 | 模型 | 硬件 | 延迟 | 备注 |
-|------|------|------|------|------|
-| VAD | silero-vad | CPU | <1ms | torch.hub 加载，极轻量 |
-| ASR | SenseVoiceSmall | GPU (1-2GB) | ~0.1s | ModelScope，非自回归 |
-| LLM | DeepSeek v4-flash | API | ~1.4s 首 token | 流式，可切换本地 vLLM |
-| TTS | VoxCPM2 | GPU (5-6GB) | ~0.1s 首音 | Ultimate Cloning，流式 |
-| Embedding | bge-m3 | GPU (2-3GB) | — | 记忆+RAG 共用 |
+**特点**：一个进程、零网络开销、`python -m` 一条命令启动。
 
-### 3.2 基础设施选型
+### 模型清单
 
-| 层次 | 技术 | 说明 |
-|------|------|------|
-| **消息队列** | Redis Streams + Pub/Sub | 轻量，单机满足；后续可换 NATS/Kafka |
-| **会话状态** | Redis Hash | session_id → {persona, history, voice, …} |
-| **对象存储** | MinIO (开发) / S3 (生产) | 音频片段、参考音频、模型权重 |
-| **向量数据库** | Qdrant (内嵌/独立) | Memory 长期记忆检索 |
-| **容器编排** | Docker Compose (单机) → K8s (集群) | 渐进式部署 |
-| **服务发现** | Docker DNS (单机) → Consul (集群) | 组件间寻址 |
-| **API 网关** | Traefik / Nginx | WebSocket 代理 + 负载均衡 |
-| **监控** | Prometheus + Grafana | GPU 利用率、延迟、吞吐 |
-
-### 3.3 开发语言与框架
-
-| 组件 | 语言 | 框架 | 原因 |
+| 组件 | 引擎 | 模型 | 显存 |
 |------|------|------|------|
-| Orchestrator | Python | aiohttp / FastAPI | 异步 WebSocket，生态成熟 |
-| VAD Worker | Python | 独立进程 | 轻量，无框架依赖 |
-| ASR Worker | Python | FastAPI + funasr | GPU 推理，HTTP/gRPC 接口 |
-| LLM Proxy | Python | FastAPI + httpx | API 代理，流式转发 |
-| TTS Worker | Python | FastAPI + voxcpm | GPU 推理 |
-| Avatar Worker | Python | FastAPI + AVTR-1 | GPU 渲染 |
-| Memory Worker | Python | FastAPI + mem0ai | 异步写入，不占语音延迟 |
-| Knowledge Worker | Python | FastAPI + sentence-transformers | PDF 入库 + 检索 |
+| VAD | Silero VAD | `snakers4/silero-vad`（torch.hub 本地） | ~0 |
+| ASR | SenseVoiceSmall | `iic/SenseVoiceSmall`（FunASR） | ~1.5 GB |
+| LLM | DeepSeek v4-flash | API 调用（`api.deepseek.com`） | 0 |
+| TTS | VoxCPM2 | `openbmb/VoxCPM2`（ModelScope） | ~5.5 GB |
+| Memory | bge-m3 | `BAAI/bge-m3`（mem0ai，默认关闭） | ~2.5 GB |
+
+### 组件接口
+
+```python
+# src/voice_infer/engine/interfaces.py
+
+class VADEngine(ABC):
+    @abstractmethod
+    async def detect(self, audio: np.ndarray, session_id: str) -> list[AudioSegment]: ...
+
+class ASREngine(ABC):
+    @abstractmethod
+    async def transcribe(self, segment: AudioSegment) -> Transcription: ...
+
+class LLMEngine(ABC):
+    @abstractmethod
+    async def generate(self, text: str, session_id: str) -> AsyncIterator[LLMResponse]: ...
+
+class TTSEngine(ABC):
+    @abstractmethod
+    async def synthesize(self, text: str, voice_id: str, session_id: str) -> AsyncIterator[AudioChunk]: ...
+```
 
 ---
 
-## 四、项目目录结构
+## 四、Phase 2 架构：多进程单机多卡
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                        单台 8×GPU 服务器                          │
+│                                                                 │
+│  ┌──────────────┐                                               │
+│  │ Orchestrator │  (CPU, 端口 8000)                              │
+│  │ 会话管理+路由 │                                               │
+│  └──────┬───────┘                                               │
+│         │                                                       │
+│         │  Unix Domain Socket (localhost)                        │
+│         │                                                       │
+│  ┌──────▼──────┬──────────┬──────────┬──────────┬──────────┐    │
+│  │  VAD Proc   │ ASR Proc │ TTS Proc │ TTS Proc │ LLM Proc │    │
+│  │  (CPU)      │ (GPU:0)  │ (GPU:1)  │ (GPU:2)  │ (CPU)    │    │
+│  │  ×1         │  ×1      │  ×1      │  ×2      │  ×1      │    │
+│  └─────────────┴──────────┴──────────┴──────────┴──────────┘    │
+│                                                                 │
+│  GPU 分配示例 (configs/gpu_alloc.yaml):                          │
+│    ASR:  GPU 0 (SenseVoiceSmall ~1.5GB)                         │
+│    TTS:  GPU 1,2 (VoxCPM2 ~5.5GB each)                          │
+│    Emb:  GPU 3 (bge-m3 ~2.5GB)                                  │
+│    Free: GPU 4-7                                                │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+通信使用自定义二进制帧协议（不走 Redis）：
+
+```
+Header (8B): [msg_type(2B)] [reserved(2B)] [payload_len(4B)]
+Payload:     JSON 元数据 + 可选二进制块(PCM/图片)
+```
+
+---
+
+## 五、Phase 3 架构：多机分布式（后续）
+
+单机 8 GPU 不够时，引入消息队列（Redis/NATS），Phase 2 完成后按需细化。
+
+---
+
+## 六、项目目录结构
 
 ```
 voice-infer-platform/
 ├── README.md
-├── docker-compose.yml          # 单机一键部署
-├── Makefile                    # 常用命令封装
+├── pyproject.toml
 │
-├── configs/                    # 配置文件
-│   ├── gateway.yaml            # API Gateway 配置
-│   ├── orchestrator.yaml       # Orchestrator 配置
-│   ├── workers.yaml            # 各 Worker 的统一配置
-│   ├── personas.yaml           # 人设注册表
-│   └── models.yaml             # 模型路径与参数
+├── configs/                     # 所有配置
+│   ├── server.yaml              # 端口、日志
+│   ├── pipeline.yaml            # 管线参数（VAD/ASR/LLM/TTS）
+│   └── personas.yaml            # 人设注册表
 │
-├── deploy/                     # 部署相关
-│   ├── docker/
-│   │   ├── Dockerfile.base     # 基础镜像（torch + 公共依赖）
-│   │   ├── Dockerfile.asr      # ASR Worker 镜像
-│   │   ├── Dockerfile.tts      # TTS Worker 镜像
-│   │   └── Dockerfile.orch     # Orchestrator 镜像
-│   └── k8s/                    # K8s 部署清单（后续）
-│       ├── namespace.yaml
-│       ├── orchestrator.yaml
-│       └── workers.yaml
-│
-├── src/                        # 源代码
+├── src/voice_infer/             # 主包
 │   ├── __init__.py
 │   │
-│   ├── common/                 # 公共模块
-│   │   ├── __init__.py
-│   │   ├── config.py           # 配置加载（YAML + env）
-│   │   ├── redis_client.py     # Redis 封装（Streams + Pub/Sub + Hash）
-│   │   ├── schema.py           # 消息协议定义（Pydantic）
-│   │   ├── audio_utils.py      # 音频处理工具（重采样、格式转换）
-│   │   ├── logging.py          # 统一日志
-│   │   └── types.py            # 公共类型定义
+│   ├── common/                  # 公共模块
+│   │   ├── config.py            # YAML 配置加载
+│   │   ├── schema.py            # 数据协议定义
+│   │   ├── audio.py             # 音频工具
+│   │   └── logging.py           # 日志
 │   │
-│   ├── orchestrator/           # 编排层
-│   │   ├── __init__.py
-│   │   ├── server.py           # aiohttp Web 服务入口
-│   │   ├── ws_handler.py       # WebSocket 会话管理
-│   │   ├── session.py          # 会话状态机
-│   │   ├── persona.py          # 人设管理与注入
-│   │   └── router.py           # 请求路由到 Worker
+│   ├── engine/                  # 推理引擎
+│   │   ├── interfaces.py        # 抽象接口
+│   │   ├── pipeline.py          # PipelineEngine 编排器
+│   │   ├── vad/silero_vad.py    # VAD 实现
+│   │   ├── asr/sensevoice.py    # ASR 实现
+│   │   ├── llm/deepseek.py      # LLM 实现
+│   │   └── tts/voxcpm2.py       # TTS 实现
 │   │
-│   ├── workers/                # 推理 Worker
-│   │   ├── __init__.py
-│   │   ├── base.py             # Worker 基类（Redis 消费循环）
-│   │   ├── vad/                # VAD Worker
-│   │   │   ├── __init__.py
-│   │   │   └── worker.py
-│   │   ├── asr/                # ASR Worker
-│   │   │   ├── __init__.py
-│   │   │   └── worker.py
-│   │   ├── llm/                # LLM Proxy
-│   │   │   ├── __init__.py
-│   │   │   └── worker.py
-│   │   ├── tts/                # TTS Worker
-│   │   │   ├── __init__.py
-│   │   │   └── worker.py
-│   │   ├── avatar/             # Avatar Worker（可选）
-│   │   │   ├── __init__.py
-│   │   │   └── worker.py
-│   │   ├── memory/             # Memory Worker
-│   │   │   ├── __init__.py
-│   │   │   └── worker.py
-│   │   └── knowledge/          # Knowledge Worker
-│   │       ├── __init__.py
-│   │       └── worker.py
+│   ├── server/                  # 服务层
+│   │   ├── app.py               # 入口
+│   │   ├── ws.py                # WebSocket
+│   │   ├── session.py           # 会话管理
+│   │   └── persona.py           # 人设
 │   │
-│   └── web/                    # 前端页面
-│       ├── index.html          # 对话主页面
-│       ├── knowledge.html      # 知识库管理页
-│       ├── css/
-│       └── js/
-│           ├── app.js          # 主逻辑
-│           ├── webrtc.js       # WebRTC 管理
-│           └── audio.js        # 音频播放/录音
+│   ├── memory/store.py          # Mem0 封装 (Phase 1 关)
+│   └── knowledge/store.py       # 知识库 (Phase 1 关)
 │
-├── tests/                      # 测试
-│   ├── unit/                   # 单元测试
-│   └── integration/            # 集成测试
+├── web/                         # 前端
+│   ├── index.html
+│   ├── css/
+│   └── js/
 │
-├── scripts/                    # 运维脚本
-│   ├── download_models.sh      # 模型下载
-│   ├── start_dev.sh            # 开发环境启动
-│   └── tunnel.sh               # SSH 隧道
-│
-├── personas/                   # 人设文件
-│   └── default.md
-│
-└── assets/                     # 素材
-    └── default/
-        ├── ref.wav
-        ├── ref.txt
-        └── ref.png
+├── tests/
+├── scripts/
+├── personas/default.md
+└── assets/default/
 ```
 
 ---
 
-## 五、核心协议设计
+## 七、配置设计
 
-### 5.1 Redis 消息通道
+### `configs/pipeline.yaml`
 
-```
-┌──────────────────────────────────────────────────────────────┐
-│                     Redis 数据结构                            │
-├──────────────────────────────────────────────────────────────┤
-│                                                              │
-│  Streams（有序持久化队列，支持 Consumer Group）                  │
-│  ─────────────────────────────────────────                   │
-│  session:<id>:audio_in         # 用户原始 PCM 音频帧           │
-│  session:<id>:speech_segments  # VAD 切出的完整语音段           │
-│  session:<id>:llm_tokens       # LLM 流式 token               │
-│  session:<id>:audio_chunks     # TTS 流式 PCM chunk           │
-│                                                              │
-│  Pub/Sub（实时广播）                                           │
-│  ────────────────                                            │
-│  session:<id>:transcription    # ASR 转写结果                  │
-│  session:<id>:response_text    # LLM 完整句子（送 TTS）        │
-│  session:<id>:control          # 控制事件（interrupt/persona）  │
-│                                                              │
-│  Hash（键值状态）                                              │
-│  ───────────────                                             │
-│  session:<id>:state            # 会话状态（persona/voice/…）   │
-│  session:<id>:history          # 对话历史（最近 N 轮）          │
-│                                                              │
-│  Keys（过期控制）                                              │
-│  ───────────────                                             │
-│  session:<id>:lock             # 会话锁（防重入, TTL 60s）     │
-│                                                              │
-└──────────────────────────────────────────────────────────────┘
-```
+```yaml
+vad:
+  engine: silero
+  min_silence_ms: 500
+  min_speech_ms: 250
 
-### 5.2 消息 Schema（JSON over Redis）
+asr:
+  engine: sensevoice
+  model: iic/SenseVoiceSmall
+  device: cuda
+  language: zh
 
-```python
-# audio_in — 用户音频帧
-{
-    "session_id": "uuid",
-    "seq": 0,                    # 帧序号
-    "timestamp": 1692000000.0,   # 采集时间戳
-    "sample_rate": 16000,
-    "audio": "<base64 pcm int16>"
-}
+llm:
+  engine: deepseek
+  model: deepseek-v4-flash
+  base_url: https://api.deepseek.com/v1
+  api_key_env: DEEPSEEK_API_KEY
+  stream: true
+  system_prompt: "你是语音助手。用中文口语回复，简短自然。"
 
-# speech_segment — VAD 切出的完整一段
-{
-    "session_id": "uuid",
-    "segment_id": "uuid",
-    "start_ms": 0,
-    "end_ms": 3200,
-    "audio": "<base64 pcm int16>"
-}
-
-# transcription — ASR 结果
-{
-    "session_id": "uuid",
-    "segment_id": "uuid",
-    "text": "你好你好",
-    "emotion": "NEUTRAL",        # SenseVoice 情绪标签
-    "is_final": true
-}
-
-# response_text — LLM 完整句子（送 TTS）
-{
-    "session_id": "uuid",
-    "turn_id": "uuid",
-    "text": "你好！有什么可以帮你的？",
-    "is_final": true             # false=流式中途
-}
-
-# llm_token — LLM 流式 token（送前端显示）
-{
-    "session_id": "uuid",
-    "turn_id": "uuid",
-    "token": "你好",
-    "index": 0
-}
-
-# audio_chunk — TTS 输出
-{
-    "session_id": "uuid",
-    "turn_id": "uuid",
-    "chunk_id": 0,
-    "sample_rate": 16000,
-    "audio": "<base64 pcm int16>",
-    "is_first": true,
-    "is_final": false
-}
-
-# control — 控制事件
-{
-    "session_id": "uuid",
-    "type": "interrupt"           # interrupt | persona_change | session_end
-}
+tts:
+  engine: voxcpm2
+  model: /root/.cache/modelscope/models/openbmb--VoxCPM2/snapshots/master
+  device: cuda
+  sample_rate: 16000
+  cfg_value: 1.0           # 无参考音频时用 1.0，音色最稳定
+  inference_timesteps: 10
+  optimize: false
+  atempo_rate: 0.886
+  # 不使用参考音频 —— VoxCPM2 内置默认声音，干净无 artifacts
+  # 参考音频会导致反馈循环劣化（详见 docs/troubleshooting.md）
 ```
 
-### 5.3 浏览器 ↔ Orchestrator WebSocket 协议
+### `configs/server.yaml`
 
-```javascript
-// → 上行（浏览器 → 服务端）
-{ "type": "audio_frame",       "audio": "<base64>", "seq": 0 }
-{ "type": "interrupt" }         // 用户打断
-{ "type": "persona_change",    "persona_id": "fengge" }
+```yaml
+server:
+  host: "0.0.0.0"
+  port: 8000
 
-// ← 下行（服务端 → 浏览器）
-{ "type": "transcription",     "text": "你好你好", "is_final": true }
-{ "type": "llm_token",         "token": "你好", "index": 0 }
-{ "type": "audio_chunk",       "audio": "<base64>", "chunk_id": 0 }
-{ "type": "status",            "persona": "fengge", "avatar": false }
+session:
+  max_history: 30
+  idle_timeout: 300
 ```
 
 ---
 
-## 六、Worker 基类设计
+## 八、实施计划
 
-```python
-# src/workers/base.py
-from abc import ABC, abstractmethod
-from redis.asyncio import Redis
-
-class BaseWorker(ABC):
-    """所有 Worker 的基类：消费 Redis Stream → 处理 → 写入下游"""
-
-    def __init__(self, redis: Redis, consumer_group: str, input_stream: str):
-        self.redis = redis
-        self.group = consumer_group
-        self.input_stream = input_stream
-
-    async def run(self):
-        """主循环：消费 → 处理 → ACK → 循环"""
-        await self._ensure_group()
-        while True:
-            messages = await self.redis.xreadgroup(
-                self.group, self.consumer_name,
-                {self.input_stream: ">"}, count=1, block=5000
-            )
-            for stream, entries in messages:
-                for msg_id, data in entries:
-                    try:
-                        await self.process(data)
-                        await self.redis.xack(self.input_stream, self.group, msg_id)
-                    except Exception as e:
-                        logger.exception("处理失败: %s", e)
-                        # 不 ACK，让其他 consumer 重试
-
-    @abstractmethod
-    async def process(self, data: dict) -> None:
-        """处理一条消息，写入下游"""
-        ...
-
-    @property
-    def consumer_name(self) -> str:
-        return f"{self.group}-{os.getpid()}"
-```
-
----
-
-## 七、会话生命周期
+### Phase 1: 核心管线 ✅ 已完成
 
 ```
-Browser 连接        Orchestrator 创建 Session         Worker 初始化
-    │                      │                              │
-    ├─ WS connect ────────►│                              │
-    │                      ├─ session:<id>:state 写入 Redis│
-    │                      ├─ persona lookup               │
-    │                      ├─ memory recall (async)        │
-    │◄─ status ────────────┤                              │
-    │                      │                              │
-    ├─ audio_frame ───────►│                              │
-    │                      ├─ XADD audio_in ──────────────►│ VAD Worker
-    │                      │                              ├─ 检测语音段
-    │                      │◄─ speech_segment ─────────────┤
-    │                      ├─ XADD speech_segments ───────►│ ASR Worker
-    │                      │                              ├─ 转写
-    │◄─ transcription ─────┤◄─ Pub/Sub transcription ─────┤
-    │                      ├─ XADD user_text ─────────────►│ LLM Proxy
-    │                      │                              ├─ 流式生成
-    │◄─ llm_token ─────────┤◄─ llm_tokens ────────────────┤
-    │                      ├─ Pub/Sub response_text ──────►│ TTS Worker
-    │                      │                              ├─ 流式合成
-    │◄─ audio_chunk ───────┤◄─ audio_chunks ──────────────┤
-    │   (浏览器播放)        │                              │
-    │                      │                              │
-    ├─ interrupt ─────────►│                              │
-    │                      ├─ Pub/Sub control:interrupt ──►│ ALL Workers
-    │                      │                              ├─ 丢弃积压数据
-    │                      │                              │
-    ├─ WS close ──────────►│                              │
-    │                      ├─ TTL 过期清理                  │
-    │                      ├─ memory save (async) ────────►│ Memory Worker
+✔ 1.1 项目骨架
+  ✔ pyproject.toml
+  ✔ common/（config, schema, audio, logging）
+  ✔ configs/ 配置文件（server.yaml, pipeline.yaml）
+
+✔ 1.2 推理引擎
+  ✔ engine/interfaces.py（抽象接口）
+  ✔ engine/vad/silero_vad.py（本地缓存加载）
+  ✔ engine/asr/sensevoice.py（FunASR + ModelScope）
+  ✔ engine/llm/deepseek.py（thinking 禁用 + 括号动作过滤）
+  ✔ engine/tts/voxcpm2.py（无参考音频，cudnn 确定性，cfg_value=1.0）
+  ✔ engine/pipeline.py（epoch 取消 + 整轮 audio_start/end）
+
+✔ 1.3 服务层
+  ✔ server/app.py（FastAPI + 双队列 WebSocket + ASGI Origin 绕过）
+  ✔ server/session.py（persona_id / voice_id 解耦）
+  ✔ server/persona.py
+
+✔ 1.4 前端
+  ✔ web/index.html（白底蓝泡录音/播放 + 打断按钮）
+
+✔ 1.5 验证
+  ✔ 端到端：说话 → 转写 → LLM 回复 → 语音播放
+  ✔ 打断功能正常
+  ✔ 已部署：ssh 隧道 localhost:8000
 ```
 
----
-
-## 八、分布式扩展设计
-
-### 8.1 扩缩策略
-
-| Worker | 扩缩方式 | 瓶颈 | 机制 |
-|--------|----------|------|------|
-| Orchestrator | 水平扩展 ×N | 无状态（状态在 Redis） | Nginx upstream / Traefik sticky session |
-| VAD | 水平扩展 ×N | CPU | Redis Consumer Group（自动负载均衡） |
-| ASR | 水平扩展 ×N | GPU 显存 | 每副本独占 1 GPU，K8s resource limit |
-| LLM Proxy | 水平扩展 ×N | API rate limit | 多 API key 轮询 / 本地 vLLM 部署 |
-| TTS | 水平扩展 ×N | GPU 显存 | 每副本独占 1 GPU，模型预热 |
-| Avatar | 水平扩展 ×N | GPU 显存 | 按需启动（冷启动容忍） |
-| Memory | 单实例 / 主从 | 写入吞吐 | 异步写入不占语音延迟 |
-
-### 8.2 Consumer Group 自动负载均衡
+### Phase 2: 多进程单机多卡
 
 ```
-                    Redis Stream: speech_segments
-                    ┌─────────────────────────────┐
-                    │ msg1  msg2  msg3  msg4 ...  │
-                    └──────┬───────┬──────────────┘
-                           │       │
-              ┌────────────┼───────┼────────────┐
-              │            │       │            │
-         ┌────▼───┐   ┌───▼───┐  ┌▼───────┐  ┌─▼───────┐
-         │ ASR-1  │   │ ASR-2 │  │ ASR-3  │  │ ASR-N   │
-         │ GPU:0  │   │ GPU:1 │  │ GPU:2  │  │ GPU:N-1 │
-         └────────┘   └───────┘  └────────┘  └─────────┘
-         
-         同一个 Consumer Group "asr-workers"
-         Redis 自动将消息分发给不同 consumer
-         每个 consumer 处理完 XACK，失败不 ACK → 自动重试
+□ 进程分离（ProcessWorker 基类 + 二进制帧协议）
+□ CUDA_VISIBLE_DEVICES GPU 隔离
+□ gpu_alloc.yaml 配置
+□ 多会话 + Worker 池
 ```
 
-### 8.3 部署形态
+### Phase 3: 分布式（按需）
 
 ```
-阶段一：单机 Docker Compose（开发/演示）
-─────────────────────────────────────
-  1× Redis, 1× Orchestrator, 1× VAD, 1× ASR, 1× TTS
-  全部容器共享 1 GPU（通过 CUDA_VISIBLE_DEVICES）
-
-阶段二：多 GPU 单机（小规模生产）
-─────────────────────────────────────
-  1× Redis, 2× Orchestrator, 2× VAD, 2× ASR, 2× TTS
-  每个 GPU Worker 绑定不同 GPU
-
-阶段三：K8s 集群（大规模生产）
-─────────────────────────────────────
-  GPU 节点池，每个 Worker 声明 GPU resource
-  HPA 根据队列深度自动扩缩
-  Redis Cluster / NATS 替代单机 Redis
+□ 消息队列 (Redis/NATS)
+□ K8s + HPA
 ```
 
----
-
-## 九、与 VoxEMW 的差异对比
-
-| 维度 | VoxEMW | 本平台 |
-|------|--------|--------|
-| **进程模型** | 3 进程（orchestrator + pipeline + avatar） | N 个独立容器（每个组件独立部署） |
-| **通信方式** | 直连 WebSocket (127.0.0.1) | Redis Streams + Pub/Sub |
-| **会话隔离** | `num_pipelines=1` 单槽位 | 每个 session 独立 Redis key 空间 |
-| **模型加载** | 启动时全量预加载 | 按 Worker 粒度懒加载 + 预热 |
-| **打断机制** | pipeline 内 cancel_scope | Redis Pub/Sub 广播 cancel 事件 |
-| **前端** | 单页 HTML + WebRTC | 同方案，WebSocket 直连 |
-| **配置** | 单文件 YAML | 分层 YAML（gateway/orchestrator/workers） |
-| **监控** | 无 | Prometheus metrics + Grafana dashboard |
-
----
-
-## 十、实施计划
-
-### Phase 1: 骨架搭建（本次）
-- [ ] 项目目录初始化
-- [ ] `common/` 公共模块（config, redis, schema, audio_utils）
-- [ ] Worker 基类 (`base.py`)
-- [ ] `docker-compose.yml`（Redis + 空服务占位）
-- [ ] `configs/` 配置文件
-
-### Phase 2: 核心管线（单体模式，快速验证）
-- [ ] Orchestrator（WebSocket + 会话管理）
-- [ ] VAD Worker（silero-vad）
-- [ ] ASR Worker（SenseVoiceSmall）
-- [ ] LLM Proxy（DeepSeek API）
-- [ ] TTS Worker（VoxCPM2）
-- [ ] 前端页面（index.html + audio 播放/录音）
-- [ ] 端到端跑通：说话 → 文字回复 + 语音播放
-
-### Phase 3: 增强功能
-- [ ] Persona 人设系统
-- [ ] Memory 长期记忆（Mem0 + Qdrant）
-- [ ] Knowledge RAG（bge-m3 + SQLite）
-- [ ] 打断功能（interrupt）
-- [ ] 流式 LLM token 前端显示
-
-### Phase 4: 分布式就绪
-- [ ] Consumer Group 多实例验证
-- [ ] GPU 资源隔离
-- [ ] 健康检查 + 自动重启
-- [ ] Prometheus metrics
-- [ ] Docker 镜像构建与优化
-
-### Phase 5: Avatar（可选）
-- [ ] AVTR-1 集成
-- [ ] WebRTC 音画轨
-- [ ] TURN 服务器
-
----
-
-## 十一、待 Review 确认
-
-1. **消息队列选择**：Redis Streams vs NATS？Redis 轻量但 NATS 更适合云原生。建议先 Redis 快速验证，后续平滑迁移。
-2. **LLM 部署模式**：纯 API 代理 vs 本地部署 vLLM/SGLang？API 模式零运维但延迟不可控。
-3. **前端方案**：沿用 VoxEMW 原生 HTML/JS 还是上 React/Vue？原生更轻量。
-4. **会话过期策略**：Redis TTL 自动清理 vs 定时任务扫描？
-5. **音频编码**：PCM int16 base64 vs 直接二进制帧？base64 调试方便但体积大 33%。
