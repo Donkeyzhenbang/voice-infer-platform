@@ -287,7 +287,9 @@ class VoxCPM2TTS(TTSEngine):
             )
 
         needs_resample = self._model_sr != self.sample_rate
-        stretcher = _AtempoStretcher(self.sample_rate, self.atempo_rate) if self.atempo_rate != 1.0 else None
+        # atempo 只用于 prompt_cache 模式（克隆语速偏快 ~12%），zero-shot 不加速
+        use_atempo = self.atempo_rate != 1.0 and cache is not None
+        stretcher = _AtempoStretcher(self.sample_rate, self.atempo_rate) if use_atempo else None
         cancelled_clean = False
         pending = np.empty(0, dtype=np.int16)
         total_out = 0
