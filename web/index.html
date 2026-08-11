@@ -72,8 +72,10 @@ let curAsst=null,curSpan=null;
 function setStatus(s){statusEl.textContent=s;statusEl.className="badge "+s;}
 
 function loadVoices(){
+  const cur=voiceSel.value;
   fetch("/api/voices").then(r=>r.json()).then(d=>{
     voiceSel.innerHTML="";d.voices.forEach(v=>{const o=document.createElement("option");o.value=v.id;o.textContent=v.id+(v.type==="builtin"?" (内置)":" (自定义)");voiceSel.appendChild(o);});
+    if(cur)voiceSel.value=cur;  // 保持之前选中的音色不丢失
   });
 }
 voiceSel.onchange=()=>{if(ws&&ws.readyState===1)ws.send(JSON.stringify({type:"voice_change",voice_id:voiceSel.value}));};
