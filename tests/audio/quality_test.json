@@ -1,0 +1,32 @@
+{
+  "roundtrip": {
+    "max_err": 3.0487775802612305e-05,
+    "rms_err": 1.7498604959429056e-05,
+    "clipped": 1
+  },
+  "continuity": {
+    "chunks": 10,
+    "max_jump": 0.024499427527189255,
+    "avg_jump": 0.007808081152486718
+  },
+  "int16": {
+    "chunks": 1,
+    "samples": 25600,
+    "rms": 0.07189294044353378,
+    "peak": 0.30542925000190735
+  },
+  "clicks": {
+    "high_diff_points": 15,
+    "click_regions": 2,
+    "boundary_clicks": 1
+  },
+  "e2e": {
+    "bytes": 199680,
+    "samples": 99840,
+    "duration": 6.24,
+    "rms": 0.0705,
+    "peak": 0.494,
+    "clipped": 0,
+    "zeros": 2844
+  }
+}

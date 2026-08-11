@@ -107,14 +107,17 @@ function drain(){
   if(!aq.length){ap=false;return;}
   ap=true;
   if(!audioCtx)audioCtx=new(window.AudioContext||window.webkitAudioContext)({sampleRate:SR});
-  // 对齐调度时间：首块立即播，后续块接在上块末尾
-  if(_nextT<audioCtx.currentTime) _nextT=audioCtx.currentTime;
-  const d=aq.shift();
-  const f=new Float32Array(d.length/2),v=new DataView(d.buffer,d.byteOffset,d.byteLength);
+  // 将所有排队 chunk 合并为一段连续 PCM
+  const all=new Uint8Array(aq.reduce((s,d)=>s+d.length,0));
+  let off=0;for(const d of aq){all.set(d,off);off+=d.length;}aq=[];
+  // 解码 int16 → float32
+  const f=new Float32Array(all.length/2),v=new DataView(all.buffer,all.byteOffset,all.byteLength);
   for(let i=0;i<f.length;i++)f[i]=v.getInt16(i*2,!0)/32768;
+  // 对齐调度
+  if(_nextT<audioCtx.currentTime)_nextT=audioCtx.currentTime;
   const b=audioCtx.createBuffer(1,f.length,SR);b.getChannelData(0).set(f);
   const s=audioCtx.createBufferSource();s.buffer=b;s.connect(audioCtx.destination);
-  const t0=_nextT, dur=f.length/SR;
+  const t0=_nextT,dur=f.length/SR;
   s.start(t0);_nextT=t0+dur;
   s.onended=()=>{if(aq.length)drain();else{ap=false;_nextT=0;}};
 }

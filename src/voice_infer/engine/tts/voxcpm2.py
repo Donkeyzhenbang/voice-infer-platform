@@ -239,29 +239,41 @@ class VoxCPM2TTS(TTSEngine):
     # ── 推理 ──────────────────────────────────────────────────
 
     async def synthesize(self, text, voice_id, session_id, turn_id="", cancelled=None):
-        """cancelled: 可选 asyncio.Event，set 后立即停止生成。"""
-        cid = 0
-        for audio_chunk in self._stream(text, voice_id, cancelled=cancelled):
-            a = np.asarray(audio_chunk).astype(np.float32)
-            if a.ndim > 1: a = a.squeeze()
-            if a.size == 0: continue
-            ab = (np.clip(a, -1.0, 1.0) * 32767).astype(np.int16).tobytes()
-            first = (cid == 0); cid += 1
-            yield AudioChunk(session_id=session_id, turn_id=turn_id, chunk_id=cid,
-                             audio=ab, sample_rate=self.sample_rate,
-                             is_first=first, is_final=False)
-        yield AudioChunk(session_id=session_id, turn_id=turn_id, chunk_id=cid + 1,
+        """cancelled: 可选 asyncio.Event，set 后立即停止生成。
+
+        产出策略：累积 _stream() 的所有 float32 块 → 一次性转为 int16 PCM → 发一个大 chunk。
+        避免多次 float32↔int16 转换和前端小块调度间隙。
+        """
+        # 收集所有 float32 音频
+        all_audio = []
+        for chunk in self._stream(text, voice_id, cancelled=cancelled):
+            a = np.asarray(chunk, dtype=np.float32).squeeze()
+            if a.size > 0:
+                all_audio.append(a)
+
+        if not all_audio:
+            yield AudioChunk(session_id=session_id, turn_id=turn_id, chunk_id=1,
+                             audio=b"", sample_rate=self.sample_rate,
+                             is_first=True, is_final=True)
+            return
+
+        full = np.concatenate(all_audio)
+        # 单次 int16 转换
+        pcm = (np.clip(full, -1.0, 1.0) * 32767).astype(np.int16).tobytes()
+        yield AudioChunk(session_id=session_id, turn_id=turn_id, chunk_id=1,
+                         audio=pcm, sample_rate=self.sample_rate,
+                         is_first=True, is_final=False)
+        yield AudioChunk(session_id=session_id, turn_id=turn_id, chunk_id=2,
                          audio=b"", sample_rate=self.sample_rate,
                          is_first=False, is_final=True)
 
     @torch.inference_mode()
     def _stream(self, text: str, voice_id: str = DEFAULT_VOICE,
                 cancelled: Optional["asyncio.Event"] = None) -> Iterator[np.ndarray]:
-        """流式合成，产出 float32 16kHz blocksize 音频块。
+        """流式合成，产出 float32 16kHz 音频块（不转 int16，交给 synthesize 统一处理）。
 
         cancelled: 外部传入的取消信号，每 chunk 检查，set 后立即停止。
         """
-        # 文本清洗
         text = re.sub(r"\s+", " ", text.replace("\n", " ")).strip()
         text = re.sub(r"[（(][^（）()]{1,20}[)）]", " ", text)
         text = re.sub(r"\s+", " ", text).strip()
@@ -276,23 +288,19 @@ class VoxCPM2TTS(TTSEngine):
             gen = self._model.tts_model._generate_with_prompt_cache(
                 target_text=text, prompt_cache=cache, min_len=2, max_len=2000,
                 inference_timesteps=self.inference_timesteps, cfg_value=self.cfg_value,
-                retry_badcase=False, streaming=True,
-                **self.gen_kwargs,
+                retry_badcase=False, streaming=True, **self.gen_kwargs,
             )
         else:
-            logger.warning("No prompt cache for '%s', zero-shot", voice_id)
             gen = self._model.generate_streaming(
                 text=text, cfg_value=self.cfg_value,
                 inference_timesteps=self.inference_timesteps,
             )
 
         needs_resample = self._model_sr != self.sample_rate
-        # atempo 只用于 prompt_cache 模式（克隆语速偏快 ~12%），zero-shot 不加速
         use_atempo = self.atempo_rate != 1.0 and cache is not None
         stretcher = _AtempoStretcher(self.sample_rate, self.atempo_rate) if use_atempo else None
         cancelled_clean = False
-        pending = np.empty(0, dtype=np.int16)
-        total_out = 0
+        buf = np.empty(0, dtype=np.float32)
 
         def _check_cancel():
             return cancelled is not None and cancelled.is_set()
@@ -312,36 +320,25 @@ class VoxCPM2TTS(TTSEngine):
                 if needs_resample:
                     audio = resample_poly(audio, self._resample_up, self._resample_down).astype(np.float32)
 
-                # atempo 变速
                 if stretcher is not None:
                     audio = stretcher.feed(audio)
                     if audio.size == 0: continue
 
-                # int16 缓冲 + blocksize 输出（修复吞音）
-                pending = np.concatenate([pending, np.clip(audio * 32767, -32768, 32767).astype(np.int16)])
-                while len(pending) >= self._blocksize:
-                    yield (pending[:self._blocksize].astype(np.float32) / 32767.0)
-                    pending = pending[self._blocksize:]
-                    total_out += self._blocksize
+                buf = np.concatenate([buf, audio])
+                # 攒够 ~0.5s 就输出一个大块（减少边界）
+                while len(buf) >= self.sample_rate // 2:
+                    yield buf[:self.sample_rate // 2]
+                    buf = buf[self.sample_rate // 2:]
         finally:
             gen.close()
-            # atempo flush
             if stretcher is not None:
                 if cancelled_clean:
                     stretcher.close()
                 else:
                     tail = stretcher.flush()
                     if tail.size:
-                        pending = np.concatenate(
-                            [pending, np.clip(tail * 32767, -32768, 32767).astype(np.int16)])
+                        buf = np.concatenate([buf, tail.astype(np.float32)])
 
-        # flush 尾巴：先整块吐完再 pad（吞音修复）
-        if len(pending) > 0:
-            while len(pending) >= self._blocksize:
-                yield (pending[:self._blocksize].astype(np.float32) / 32767.0)
-                pending = pending[self._blocksize:]
-                total_out += self._blocksize
-            if len(pending) > 0:
-                total_out += len(pending)
-                padded = np.pad(pending, (0, self._blocksize - len(pending)))
-                yield (padded.astype(np.float32) / 32767.0)
+        # flush 剩余
+        if len(buf) > 0:
+            yield buf
