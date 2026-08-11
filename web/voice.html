@@ -31,7 +31,7 @@ h1{font-size:20px;font-weight:600}
 
 <script>
 const btn=document.getElementById("recBtn"),hint=document.getElementById("hint"),result=document.getElementById("result");
-let recording=false,recorder=null,stream=null;
+let recording=false,chunks=[],recorder=null,stream=null;
 const SR=16000, MAX_DURATION=15;
 
 btn.onclick=()=>recording?stop():start();
@@ -53,6 +53,7 @@ async function start(){
     let peakDetect=setInterval(()=>{},1000);  // placeholder
     recorder.ondataavailable=e=>{if(e.data.size>0)chunks.push(e.data);};
     recorder.onstop=async ()=>{
+      try{
       stream.getTracks().forEach(t=>t.stop()); btn.classList.remove("recording");
       hint.textContent="处理中（降噪+标准化）..."; result.innerHTML="";
 
@@ -114,6 +115,7 @@ async function start(){
         if(d.ok){result.innerHTML='<span class="success">✅ 音色创建成功！<br>请返回对话页面，刷新后即可使用你的声音</span>';hint.textContent="完成";}
         else{result.innerHTML='<span class="error">❌ 创建失败: '+JSON.stringify(d)+'</span>';hint.textContent="失败，请重试";}
       }catch(e){result.innerHTML='<span class="error">❌ 上传失败: '+e.message+'</span>';hint.textContent="失败，请重试";}
+      }catch(e){hint.textContent="❌ 处理失败: "+e.message; console.error(e);}
     };
     recorder.start();
     setTimeout(()=>{if(recording)recorder.stop();},MAX_DURATION*1000);
