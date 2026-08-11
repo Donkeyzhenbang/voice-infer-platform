@@ -30,7 +30,7 @@ tts:
   model: /root/.cache/modelscope/models/openbmb--VoxCPM2/snapshots/master
   device: cuda
   sample_rate: 16000
-  cfg_value: 2.0
+  cfg_value: 1.0  # 无参考音频时用 1.0 音色最稳定，越高越容易漂移
   inference_timesteps: 10
   optimize: false
   atempo_rate: 0.886

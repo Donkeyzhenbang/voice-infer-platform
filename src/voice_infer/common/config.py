@@ -47,7 +47,7 @@ class TTSConfig(BaseModel):
     model: str = ""
     device: str = "cuda"
     sample_rate: int = 16000
-    cfg_value: float = 2.0
+    cfg_value: float = 1.0
     inference_timesteps: int = 10
     optimize: bool = False
     atempo_rate: float = 1.0
