@@ -61,6 +61,10 @@ const convEl=document.getElementById("conversation"),statusEl=document.getElemen
 const hintEl=document.getElementById("hint"),voiceSel=document.getElementById("voiceSel");
 let ws=null,audioCtx=null,stream=null,listening=false;const SR=16000;
 
+// AudioWorklet nodes
+let micNode=null,playNode=null;
+let workletReady=false;
+
 function addMsg(role,text){
   const d=document.createElement("div");d.className="msg "+role;
   const l=document.createElement("div");l.className="label";l.textContent=role==="user"?"你":"AI";d.appendChild(l);
@@ -101,49 +105,47 @@ function connect(){
 }
 
 let aq=[],ap=false,_nextT=0;
-function resetAudio(){aq=[];ap=false;_nextT=0;}
-function playChunk(d){aq.push(d);if(!ap)drain();}
-function drain(){
-  if(!aq.length){ap=false;return;}
-  ap=true;
-  if(!audioCtx)audioCtx=new(window.AudioContext||window.webkitAudioContext)({sampleRate:SR});
-  // 取队列中所有 chunk 合并为一段连续 PCM（减少调度次数）
-  const all=new Uint8Array(aq.reduce((s,d)=>s+d.length,0));
-  let off=0;for(const d of aq){all.set(d,off);off+=d.length;}aq=[];
-  const f=new Float32Array(all.length/2),v=new DataView(all.buffer,all.byteOffset,all.byteLength);
-  for(let i=0;i<f.length;i++)f[i]=v.getInt16(i*2,!0)/32768;
-  // 精确调度：接在上次末尾
-  if(_nextT<audioCtx.currentTime)_nextT=audioCtx.currentTime;
-  const b=audioCtx.createBuffer(1,f.length,SR);b.getChannelData(0).set(f);
-  const s=audioCtx.createBufferSource();s.buffer=b;s.connect(audioCtx.destination);
-  const t0=_nextT,dur=f.length/SR;
-  s.start(t0);_nextT=t0+dur;
-  s.onended=()=>{if(aq.length)drain();else{ap=false;_nextT=0;}};
+function resetAudio(){aq=[];ap=false;_nextT=0;if(playNode)playNode.port.postMessage("reset");}
+function playChunk(d){
+  if(playNode)playNode.port.postMessage(d.buffer, [d.buffer]);
 }
 
 micBtn.onclick=()=>listening?stopMic():startMic();
 stopBtn.onclick=()=>{if(ws&&ws.readyState===1)ws.send(JSON.stringify({type:"interrupt"}));resetAudio();stopBtn.style.display="none";setStatus(listening?"listening":"ready");};
 
+async function ensureAudioCtx(){
+  if(!audioCtx)audioCtx=new(window.AudioContext||window.webkitAudioContext)({sampleRate:SR});
+  if(!workletReady){
+    await audioCtx.audioWorklet.addModule("/voice-processor.js");
+    workletReady=true;
+  }
+}
+
 async function startMic(){
   try{
+    await ensureAudioCtx();
     stream=await navigator.mediaDevices.getUserMedia({audio:{sampleRate:SR,channelCount:1,echoCancellation:!0,noiseSuppression:!0}});
-    audioCtx=audioCtx||new(window.AudioContext||window.webkitAudioContext)({sampleRate:SR});
-    const src=audioCtx.createMediaStreamSource(stream),proc=audioCtx.createScriptProcessor(4096,1,1);
-    src.connect(proc);proc.connect(audioCtx.destination);
-    proc.onaudioprocess=e=>{
+    if(!playNode){
+      playNode=new AudioWorkletNode(audioCtx,"voice-processor",{processorOptions:{mode:"play"}});
+      playNode.connect(audioCtx.destination);
+    }
+    const src=audioCtx.createMediaStreamSource(stream);
+    micNode=new AudioWorkletNode(audioCtx,"voice-processor",{processorOptions:{mode:"mic"}});
+    src.connect(micNode);
+    micNode.port.onmessage=e=>{
       if(!listening||!ws||ws.readyState!==1)return;
-      const inp=e.inputBuffer.getChannelData(0),i16=new Int16Array(inp.length);
-      for(let i=0;i<inp.length;i++)i16[i]=Math.max(-32768,Math.min(32767,Math.round(inp[i]*32767)));
-      ws.send(i16.buffer);
+      ws.send(e.data);
     };
     listening=!0;micBtn.classList.remove("primary");micBtn.classList.add("danger");setStatus("listening");hintEl.textContent="正在收音，直接说话...";
   }catch(e){hintEl.textContent="麦克风权限未授予";}
 }
 function stopMic(){
-  listening=!1;micBtn.classList.remove("danger");micBtn.classList.add("primary");if(stream){stream.getTracks().forEach(t=>t.stop());stream=null;}setStatus("ready");hintEl.textContent="点击麦克风开始";
+  listening=!1;micBtn.classList.remove("danger");micBtn.classList.add("primary");
+  if(micNode){micNode.disconnect();micNode.port.onmessage=null;micNode=null;}
+  if(stream){stream.getTracks().forEach(t=>t.stop());stream=null;}
+  setStatus("ready");hintEl.textContent="点击麦克风开始";
 }
 document.addEventListener("keydown",e=>{if(e.code==="Space"&&e.target===document.body){e.preventDefault();micBtn.click();}});
 connect();
 </script>
 </body>
-</html>

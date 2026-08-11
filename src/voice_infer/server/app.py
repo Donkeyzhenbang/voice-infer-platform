@@ -155,7 +155,7 @@ def create_app(config=None):
     voices = {vid: VoiceSpec(vid, _abs(vc.ref_wav), vc.ref_text) for vid, vc in tc.voices.items()}
     tts = VoxCPM2TTS(tc.model, tc.device, tc.sample_rate, tc.cfg_value, tc.inference_timesteps,
                      atempo_rate=tc.atempo_rate, voices=voices)
-    tts.load_model()
+    tts.load_model(optimize=tc.optimize)
     pipeline = PipelineEngine(vad, asr, llm, tts); sessions = SessionManager()
     voice_mgr = VoiceManager(tts, config)
     api_key = os.environ.get(lc.api_key_env, "")
@@ -181,6 +181,12 @@ def create_app(config=None):
     async def voice_page():
         hp = REPO_ROOT / "web" / "voice.html"
         return HTMLResponse(hp.read_text("utf-8")) if hp.is_file() else HTMLResponse("<h1>Record</h1>")
+
+    @app.get("/voice-processor.js")
+    async def awp():
+        from fastapi.responses import Response
+        js = (REPO_ROOT / "web" / "voice-processor.js").read_text("utf-8")
+        return Response(js, media_type="application/javascript")
 
     @app.get("/api/personas")
     async def api_p():

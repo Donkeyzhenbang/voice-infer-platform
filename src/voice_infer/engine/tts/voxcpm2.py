@@ -202,14 +202,14 @@ class VoxCPM2TTS(TTSEngine):
 
     # ── 模型加载 ──────────────────────────────────────────────
 
-    def load_model(self):
+    def load_model(self, optimize: bool = False):
         if self._model is not None: return
         from voxcpm import VoxCPM
         self._model = VoxCPM.from_pretrained(
             self.model_path, device=self.device,
-            load_denoiser=False, optimize=False, local_files_only=True)
+            load_denoiser=False, optimize=optimize, local_files_only=True)
         self._model_sr = int(self._model.tts_model.sample_rate)
-        logger.info("VoxCPM2 loaded (sr=%d)", self._model_sr)
+        logger.info("VoxCPM2 loaded (sr=%d, optimize=%s)", self._model_sr, optimize)
 
         g = math.gcd(self._model_sr, self.sample_rate)
         self._resample_up = self.sample_rate // g
@@ -239,10 +239,8 @@ class VoxCPM2TTS(TTSEngine):
     # ── 推理 ──────────────────────────────────────────────────
 
     async def synthesize(self, text, voice_id, session_id, turn_id="", cancelled=None):
-        """流式产出：_stream() 每出一个 float32 块 → 立即转 int16 → yield。
-
-        cancelled: asyncio.Event，set 后立即停止。
-        """
+        """流式产出 + 不阻塞事件循环（每 chunk 后 await sleep(0)）。"""
+        import asyncio
         cid = 0
         for chunk in self._stream(text, voice_id, cancelled=cancelled):
             a = np.asarray(chunk, dtype=np.float32).squeeze()
@@ -252,6 +250,7 @@ class VoxCPM2TTS(TTSEngine):
             yield AudioChunk(session_id=session_id, turn_id=turn_id, chunk_id=cid,
                              audio=pcm, sample_rate=self.sample_rate,
                              is_first=first, is_final=False)
+            await asyncio.sleep(0)  # 释放事件循环，让 interrupt/WS 能及时处理
         yield AudioChunk(session_id=session_id, turn_id=turn_id, chunk_id=cid + 1,
                          audio=b"", sample_rate=self.sample_rate,
                          is_first=(cid == 0), is_final=True)

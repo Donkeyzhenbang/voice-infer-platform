@@ -32,7 +32,7 @@ tts:
   sample_rate: 16000
   cfg_value: 2.0
   inference_timesteps: 10
-  optimize: false
+  optimize: true  # torch.compile: RTF ~0.6→0.2, 启动+1-2min
   atempo_rate: 0.886  # 抵消 VoxCPM2 克隆语速偏快 ~12%（1.0=不变速）
   voices:
     default:
