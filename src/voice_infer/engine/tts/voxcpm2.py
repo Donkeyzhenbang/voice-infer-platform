@@ -239,33 +239,22 @@ class VoxCPM2TTS(TTSEngine):
     # ── 推理 ──────────────────────────────────────────────────
 
     async def synthesize(self, text, voice_id, session_id, turn_id="", cancelled=None):
-        """cancelled: 可选 asyncio.Event，set 后立即停止生成。
+        """流式产出：_stream() 每出一个 float32 块 → 立即转 int16 → yield。
 
-        产出策略：累积 _stream() 的所有 float32 块 → 一次性转为 int16 PCM → 发一个大 chunk。
-        避免多次 float32↔int16 转换和前端小块调度间隙。
+        cancelled: asyncio.Event，set 后立即停止。
         """
-        # 收集所有 float32 音频
-        all_audio = []
+        cid = 0
         for chunk in self._stream(text, voice_id, cancelled=cancelled):
             a = np.asarray(chunk, dtype=np.float32).squeeze()
-            if a.size > 0:
-                all_audio.append(a)
-
-        if not all_audio:
-            yield AudioChunk(session_id=session_id, turn_id=turn_id, chunk_id=1,
-                             audio=b"", sample_rate=self.sample_rate,
-                             is_first=True, is_final=True)
-            return
-
-        full = np.concatenate(all_audio)
-        # 单次 int16 转换
-        pcm = (np.clip(full, -1.0, 1.0) * 32767).astype(np.int16).tobytes()
-        yield AudioChunk(session_id=session_id, turn_id=turn_id, chunk_id=1,
-                         audio=pcm, sample_rate=self.sample_rate,
-                         is_first=True, is_final=False)
-        yield AudioChunk(session_id=session_id, turn_id=turn_id, chunk_id=2,
+            if a.size == 0: continue
+            pcm = (np.clip(a, -1.0, 1.0) * 32767).astype(np.int16).tobytes()
+            first = (cid == 0); cid += 1
+            yield AudioChunk(session_id=session_id, turn_id=turn_id, chunk_id=cid,
+                             audio=pcm, sample_rate=self.sample_rate,
+                             is_first=first, is_final=False)
+        yield AudioChunk(session_id=session_id, turn_id=turn_id, chunk_id=cid + 1,
                          audio=b"", sample_rate=self.sample_rate,
-                         is_first=False, is_final=True)
+                         is_first=(cid == 0), is_final=True)
 
     @torch.inference_mode()
     def _stream(self, text: str, voice_id: str = DEFAULT_VOICE,
