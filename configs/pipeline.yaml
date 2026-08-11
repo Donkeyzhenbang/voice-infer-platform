@@ -1,0 +1,53 @@
+# Voice Inference Platform — 管线配置
+
+vad:
+  engine: silero
+  min_silence_ms: 500
+  min_speech_ms: 250
+  speech_pad_ms: 400
+
+asr:
+  engine: sensevoice
+  model: iic/SenseVoiceSmall
+  device: cuda
+  language: zh
+
+llm:
+  engine: deepseek
+  model: deepseek-v4-flash
+  base_url: https://api.deepseek.com/v1
+  api_key_env: DEEPSEEK_API_KEY
+  stream: true
+  max_tokens: 2048
+  temperature: 0.7
+  # 系统提示词：人设正文由 persona 文件注入，这里放通用约束
+  system_prompt: |
+    你是语音助手。用中文口语回复，简短自然，每句话不超过30字。
+    不评价、不说教、不加动作描述。直接回答问题。
+
+tts:
+  engine: voxcpm2
+  model: /root/.cache/modelscope/models/openbmb--VoxCPM2/snapshots/master
+  device: cuda
+  sample_rate: 16000
+  cfg_value: 2.0
+  inference_timesteps: 10
+  optimize: false
+  atempo_rate: 0.886
+  voices:
+    default:
+      ref_wav: assets/default/ref.wav
+      ref_text: assets/default/ref.txt
+
+memory:
+  enabled: true
+  embedder_model_path: /root/.cache/modelscope/models/BAAI--bge-m3/snapshots/master
+  store_dir: data/memory
+  top_k: 5
+
+knowledge:
+  enabled: true
+  embedder_model_path: /root/.cache/modelscope/models/BAAI--bge-m3/snapshots/master
+  db_path: data/knowledge.db
+  top_k: 3
+  threshold: 0.45

@@ -1,0 +1,25 @@
+Metadata-Version: 2.4
+Name: voice-infer
+Version: 0.1.0
+Summary: 分布式语音推理服务平台
+Requires-Python: >=3.10
+Requires-Dist: fastapi>=0.115
+Requires-Dist: uvicorn[standard]>=0.30
+Requires-Dist: websockets>=12
+Requires-Dist: numpy>=2.0
+Requires-Dist: pyyaml>=6.0
+Requires-Dist: pydantic>=2.0
+Requires-Dist: soundfile>=0.12
+Requires-Dist: funasr>=1.4
+Requires-Dist: voxcpm>=2.0.3
+Requires-Dist: torch>=2.8
+Requires-Dist: torchaudio>=2.8
+Requires-Dist: httpx>=0.27
+Requires-Dist: aiofiles>=24
+Provides-Extra: memory
+Requires-Dist: mem0ai; extra == "memory"
+Requires-Dist: sentence-transformers; extra == "memory"
+Requires-Dist: qdrant-client; extra == "memory"
+Provides-Extra: dev
+Requires-Dist: pytest; extra == "dev"
+Requires-Dist: pytest-asyncio; extra == "dev"

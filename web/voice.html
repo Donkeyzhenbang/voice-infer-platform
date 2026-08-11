@@ -1,0 +1,80 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>录制音色 - Voice Infer</title>
+<style>
+*{margin:0;padding:0;box-sizing:border-box}
+body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;background:#0f0f0f;color:#e0e0e0;min-height:100vh;display:flex;flex-direction:column;align-items:center;justify-content:center;gap:24px;padding:20px}
+h1{font-size:20px;font-weight:600}
+.script{background:#1a1a1a;border:1px solid #333;border-radius:12px;padding:20px 28px;font-size:22px;line-height:1.8;text-align:center;max-width:500px;color:#fff;letter-spacing:2px}
+.btn{width:72px;height:72px;border-radius:50%;border:2px solid #f44336;background:#2a1010;cursor:pointer;display:flex;align-items:center;justify-content:center;transition:all 0.2s}
+.btn:hover{transform:scale(1.1)}
+.btn.recording{animation:pulse 1s infinite}
+.btn svg{width:32px;height:32px;fill:#f44336}
+@keyframes pulse{0%,100%{box-shadow:0 0 0 0 rgba(244,67,54,0.4)}50%{box-shadow:0 0 0 20px rgba(244,67,54,0)}}
+.hint{font-size:14px;color:#888}
+.success{color:#4caf50;font-size:14px}
+.error{color:#f44336;font-size:14px}
+.back{color:#555;text-decoration:none;font-size:13px;position:absolute;top:16px;left:16px}
+</style>
+</head>
+<body>
+<a href="/" class="back">← 返回对话</a>
+<h1>🎤 录制你的音色</h1>
+<div class="script" id="script">请朗读以下文字：<br><br>今天天气真好，我想出去走走。阳光明媚，微风轻拂，春天真的来了。</div>
+<div class="hint" id="hint">点击红色按钮开始朗读，读完自动停止</div>
+<button class="btn" id="recBtn">
+  <svg viewBox="0 0 24 24"><circle cx="12" cy="12" r="8"/></svg>
+</button>
+<div id="result"></div>
+
+<script>
+const btn=document.getElementById("recBtn"),hint=document.getElementById("hint"),result=document.getElementById("result");
+let recording=false,chunks=[],recorder=null,stream=null;
+const SR=16000;
+
+btn.onclick=()=>recording?stop():start();
+async function start(){
+  try{
+    stream=await navigator.mediaDevices.getUserMedia({audio:{sampleRate:SR,channelCount:1,echoCancellation:!0,noiseSuppression:!1}});
+    chunks=[];recording=true;btn.classList.add("recording");hint.textContent="🔴 正在录音...请朗读上方文字";
+    recorder=new MediaRecorder(stream,{mimeType:"audio/webm"});
+    recorder.ondataavailable=e=>{if(e.data.size>0)chunks.push(e.data);};
+    recorder.onstop=async()=>{
+      stream.getTracks().forEach(t=>t.stop());btn.classList.remove("recording");
+      hint.textContent="处理中...";result.innerHTML="";
+      const blob=new Blob(chunks,{type:"audio/webm"});
+      const ab=await blob.arrayBuffer();
+      const actx=new(window.AudioContext||window.webkitAudioContext)({sampleRate:SR});
+      const abuf=await actx.decodeAudioData(ab);
+      const pcm=abuf.getChannelData(0);
+      const i16=new Int16Array(pcm.length);
+      for(let i=0;i<pcm.length;i++)i16[i]=Math.max(-32768,Math.min(32767,Math.round(pcm[i]*32767)));
+      // 封装 WAV
+      const buf=new ArrayBuffer(44+i16.length*2),v=new DataView(buf);
+      "RIFF".split("").forEach((c,i)=>v.setUint8(i,c.charCodeAt(0)));v.setUint32(4,36+i16.length*2,true);
+      "WAVEfmt ".split("").forEach((c,i)=>v.setUint8(8+i,c.charCodeAt(0)));v.setUint32(16,16,true);
+      v.setUint16(20,1,true);v.setUint16(22,1,true);v.setUint32(24,SR,true);
+      v.setUint32(28,SR*2,true);v.setUint16(32,2,true);v.setUint16(34,16,true);
+      "data".split("").forEach((c,i)=>v.setUint8(36+i,c.charCodeAt(0)));v.setUint32(40,i16.length*2,true);
+      for(let i=0;i<i16.length;i++)v.setInt16(44+i*2,i16[i],true);
+      // 上传
+      const form=new FormData();form.append("file",new Blob([buf],{type:"audio/wav"}),"voice.wav");
+      form.append("voice_id","my_voice");form.append("ref_text","今天天气真好，我想出去走走。阳光明媚，微风轻拂，春天真的来了。");
+      try{
+        const r=await fetch("/api/voices/create",{method:"POST",body:form});
+        const d=await r.json();
+        if(d.ok){result.innerHTML='<span class="success">✅ 音色创建成功！<br>请返回对话页面，刷新后即可使用你的声音</span>';hint.textContent="完成";}
+        else{result.innerHTML='<span class="error">❌ 创建失败: '+JSON.stringify(d)+'</span>';hint.textContent="失败，请重试";}
+      }catch(e){result.innerHTML='<span class="error">❌ 上传失败: '+e.message+'</span>';hint.textContent="失败，请重试";}
+    };
+    recorder.start();
+    // 自动在 15 秒后停止
+    setTimeout(()=>{if(recording)recorder.stop();},15000);
+  }catch(e){hint.textContent="麦克风权限未授予: "+e.message;}
+}
+function stop(){recording=false;if(recorder)recorder.stop();}
+</script>
+</body>
+</html>
