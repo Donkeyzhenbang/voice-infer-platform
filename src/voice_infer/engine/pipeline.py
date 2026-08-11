@@ -1,4 +1,4 @@
-"""Pipeline：LLM 流式输出 → 后台 TTS 并发生成，首音延迟最小化。"""
+"""Pipeline：串行 LLM→TTS + 三层记忆。先稳再快。"""
 
 from __future__ import annotations
 
@@ -12,12 +12,14 @@ logger = logging.getLogger(__name__)
 
 
 class PipelineEngine:
-    def __init__(self, vad, asr, llm, tts):
+    def __init__(self, vad, asr, llm, tts, memory=None, knowledge=None):
         self.vad = vad; self.asr = asr; self.llm = llm; self.tts = tts
+        self.memory = memory; self.knowledge = knowledge
         self._history: dict[str, list[dict]] = {}
         self._epoch: dict[str, int] = {}
         self._locks: dict[str, asyncio.Lock] = {}
         self._cancel_events: dict[str, asyncio.Event] = {}
+        self._persona_id: dict[str, str] = {}
 
     def _is_stale(self, sid, epoch): return self._epoch.get(sid, 0) != epoch
 
@@ -26,6 +28,19 @@ class PipelineEngine:
         ev = self._cancel_events.get(sid)
         if ev: ev.set()
         await self.vad.reset(sid)
+
+    def _build_instructions(self, session_id, base_instructions, user_text):
+        parts = [base_instructions] if base_instructions else []
+        if self.memory and self.memory.enabled:
+            agent_id = self._persona_id.get(session_id, "default")
+            mems = self.memory.recall(agent_id)
+            if mems:
+                parts.append("# 关于用户的记忆\n" + "\n".join(f"- {m}" for m in mems))
+        if self.knowledge and self.knowledge.enabled:
+            rag = self.knowledge.build_rag_block(user_text)
+            if rag:
+                parts.append(rag)
+        return "\n\n".join(parts) if parts else ""
 
     async def process(self, audio_chunk: bytes, session_id: str,
                       instructions=None, voice_id="default",
@@ -50,73 +65,26 @@ class PipelineEngine:
             full, turn_id = "", uuid.uuid4().hex[:12]
             audio_started = False
 
-            # 后台 TTS 队列：LLM 每出一句立即异步提交
-            tts_out: asyncio.Queue = asyncio.Queue(maxsize=256)
-
-            async def _run_tts(text: str, seq: int):
-                try:
-                    async for c in self.tts.synthesize(
-                        text=text, voice_id=voice_id, session_id=session_id,
-                        turn_id=turn_id, cancelled=cancel_ev,
-                    ):
-                        if self._is_stale(session_id, epoch): return
-                        await tts_out.put((seq, c))
-                except Exception as e:
-                    logger.error("TTS bg error: %s", e)
-
-            tts_tasks = []
-            seq = 0
-            pending: dict[int, list] = {}
-            next_out = 0
+            enriched = self._build_instructions(session_id, instructions, t.text.strip())
 
             async for r in self.llm.generate(
                 user_text=t.text.strip(), session_id=session_id,
-                history=history, instructions=instructions,
+                history=history, instructions=enriched or instructions,
             ):
                 if self._is_stale(session_id, epoch): return
                 yield r; full += r.text
 
-                # 后台提交 TTS（不阻塞 LLM）
-                tts_tasks.append(asyncio.create_task(_run_tts(r.text, seq)))
-                seq += 1
-
-                # 非阻塞收 TTS 已有输出
-                while True:
-                    try:
-                        s, c = tts_out.get_nowait()
-                    except asyncio.QueueEmpty:
-                        break
-                    pending.setdefault(s, []).append(c)
-                # 按序输出
-                while next_out in pending:
-                    for pc in pending.pop(next_out):
-                        if self._is_stale(session_id, epoch): return
-                        if pc.is_first and not audio_started:
-                            audio_started = True
-                            yield AudioChunk(session_id=session_id, turn_id=turn_id, chunk_id=0, audio=b"", sample_rate=16000, is_first=True, is_final=False)
-                        yield AudioChunk(session_id=pc.session_id, turn_id=turn_id, chunk_id=pc.chunk_id,
-                                         audio=pc.audio, sample_rate=pc.sample_rate,
-                                         is_first=False, is_final=pc.is_final)
-                    next_out += 1
-
-            # LLM 结束，等所有 TTS 完成
-            if tts_tasks:
-                await asyncio.gather(*tts_tasks, return_exceptions=True)
-
-            # 收尾
-            while not tts_out.empty():
-                s, c = tts_out.get_nowait()
-                pending.setdefault(s, []).append(c)
-            while next_out in pending:
-                for pc in pending.pop(next_out):
+                async for c in self.tts.synthesize(
+                    text=r.text, voice_id=voice_id, session_id=session_id,
+                    turn_id=turn_id, cancelled=cancel_ev,
+                ):
                     if self._is_stale(session_id, epoch): return
-                    if pc.is_first and not audio_started:
+                    if c.is_first and not audio_started:
                         audio_started = True
                         yield AudioChunk(session_id=session_id, turn_id=turn_id, chunk_id=0, audio=b"", sample_rate=16000, is_first=True, is_final=False)
-                    yield AudioChunk(session_id=pc.session_id, turn_id=turn_id, chunk_id=pc.chunk_id,
-                                     audio=pc.audio, sample_rate=pc.sample_rate,
-                                     is_first=False, is_final=pc.is_final)
-                next_out += 1
+                    yield AudioChunk(session_id=c.session_id, turn_id=turn_id, chunk_id=c.chunk_id,
+                                     audio=c.audio, sample_rate=c.sample_rate,
+                                     is_first=False, is_final=c.is_final)
 
             if audio_started:
                 yield AudioChunk(session_id=session_id, turn_id=turn_id, chunk_id=9999, audio=b"", sample_rate=16000, is_first=False, is_final=True)
@@ -126,6 +94,11 @@ class PipelineEngine:
                 history.append({"role": "assistant", "content": full.strip()})
                 if len(history) > 60: history = history[-60:]
                 self._history[session_id] = history
+
+                if self.memory and self.memory.enabled:
+                    agent_id = self._persona_id.get(session_id, "default")
+                    asyncio.create_task(asyncio.to_thread(
+                        self.memory.remember, t.text.strip(), full.strip(), agent_id))
 
         finally:
             self._cancel_events.pop(session_id, None)

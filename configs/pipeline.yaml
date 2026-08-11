@@ -46,7 +46,7 @@ memory:
   top_k: 5
 
 knowledge:
-  enabled: true
+  enabled: false  # 暂关：与 Memory 共享 BGE-M3 需重构
   embedder_model_path: /root/.cache/modelscope/models/BAAI--bge-m3/snapshots/master
   db_path: data/knowledge.db
   top_k: 3

@@ -72,6 +72,7 @@ async def _ws_handler(ws, pipeline, sessions, personas, voice_mgr):
                         pid = msg.get("persona_id", "default")
                         p = personas.get(pid, dp)
                         sessions.update_persona(sid, pid, p.get("text", ""))
+                        pipeline._persona_id[sid] = pid
                         await out_queue.put(json.dumps({"type": "persona_changed", "persona_id": pid}))
                     elif t == "voice_change":
                         sessions.update_voice(sid, msg.get("voice_id", "default"))
@@ -156,10 +157,16 @@ def create_app(config=None):
     tts = VoxCPM2TTS(tc.model, tc.device, tc.sample_rate, tc.cfg_value, tc.inference_timesteps,
                      atempo_rate=tc.atempo_rate, voices=voices)
     tts.load_model(optimize=tc.optimize)
-    pipeline = PipelineEngine(vad, asr, llm, tts); sessions = SessionManager()
-    voice_mgr = VoiceManager(tts, config)
+
     api_key = os.environ.get(lc.api_key_env, "")
     memory = create_memory_store(pc, api_key)
+
+    from voice_infer.knowledge.store import create_knowledge_store
+    knowledge = create_knowledge_store(pc)
+
+    pipeline = PipelineEngine(vad, asr, llm, tts, memory=memory, knowledge=knowledge)
+    sessions = SessionManager()
+    voice_mgr = VoiceManager(tts, config)
 
     personas = {}
     pd = REPO_ROOT / "personas"
