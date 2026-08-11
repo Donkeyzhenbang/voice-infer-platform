@@ -33,7 +33,7 @@ tts:
   cfg_value: 2.0
   inference_timesteps: 10
   optimize: false
-  atempo_rate: 0.886
+  atempo_rate: 0.886  # 抵消 VoxCPM2 克隆语速偏快 ~12%（1.0=不变速）
   voices:
     default:
       ref_wav: assets/default/ref.wav

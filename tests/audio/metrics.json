@@ -1,0 +1,134 @@
+[
+  {
+    "name": "short_10",
+    "voice_id": "default",
+    "ttfa_s": 0.104,
+    "total_s": 4.904,
+    "duration_s": 8.0,
+    "rtf": 0.613,
+    "rms": 0.079993,
+    "samples": 128000,
+    "wav": "/root/voice-infer-platform/tests/audio/short_10_default.wav"
+  },
+  {
+    "name": "normal_30",
+    "voice_id": "default",
+    "ttfa_s": 0.105,
+    "total_s": 20.003,
+    "duration_s": 32.32,
+    "rtf": 0.619,
+    "rms": 0.090621,
+    "samples": 517120,
+    "wav": "/root/voice-infer-platform/tests/audio/normal_30_default.wav"
+  },
+  {
+    "name": "long_100",
+    "voice_id": "default",
+    "ttfa_s": 0.106,
+    "total_s": 17.215,
+    "duration_s": 26.72,
+    "rtf": 0.644,
+    "rms": 0.105482,
+    "samples": 427520,
+    "wav": "/root/voice-infer-platform/tests/audio/long_100_default.wav"
+  },
+  {
+    "name": "question",
+    "voice_id": "default",
+    "ttfa_s": 0.102,
+    "total_s": 7.59,
+    "duration_s": 11.84,
+    "rtf": 0.641,
+    "rms": 0.084728,
+    "samples": 189440,
+    "wav": "/root/voice-infer-platform/tests/audio/question_default.wav"
+  },
+  {
+    "name": "happy",
+    "voice_id": "default",
+    "ttfa_s": 0.108,
+    "total_s": 3.621,
+    "duration_s": 5.76,
+    "rtf": 0.629,
+    "rms": 0.099112,
+    "samples": 92160,
+    "wav": "/root/voice-infer-platform/tests/audio/happy_default.wav"
+  },
+  {
+    "name": "mixed_zh_en",
+    "voice_id": "default",
+    "ttfa_s": 0.101,
+    "total_s": 7.499,
+    "duration_s": 11.84,
+    "rtf": 0.633,
+    "rms": 0.091608,
+    "samples": 189440,
+    "wav": "/root/voice-infer-platform/tests/audio/mixed_zh_en_default.wav"
+  },
+  {
+    "name": "voice_cmp_default",
+    "voice_id": "default",
+    "ttfa_s": 0.1,
+    "total_s": 5.516,
+    "duration_s": 8.64,
+    "rtf": 0.638,
+    "rms": 0.087747,
+    "samples": 138240,
+    "wav": "/root/voice-infer-platform/tests/audio/voice_cmp_default_default.wav"
+  },
+  {
+    "name": "voice_cmp_my_voice",
+    "voice_id": "my_voice",
+    "ttfa_s": 0.107,
+    "total_s": 1.526,
+    "duration_s": 2.4,
+    "rtf": 0.636,
+    "rms": 0.084645,
+    "samples": 38400,
+    "wav": "/root/voice-infer-platform/tests/audio/voice_cmp_my_voice_my_voice.wav"
+  },
+  {
+    "name": "stability_1",
+    "voice_id": "default",
+    "ttfa_s": 0.103,
+    "total_s": 8.45,
+    "duration_s": 13.12,
+    "rtf": 0.644,
+    "rms": 0.084484,
+    "samples": 209920,
+    "wav": "/root/voice-infer-platform/tests/audio/stability_1_default.wav"
+  },
+  {
+    "name": "stability_2",
+    "voice_id": "default",
+    "ttfa_s": 0.107,
+    "total_s": 8.101,
+    "duration_s": 13.12,
+    "rtf": 0.617,
+    "rms": 0.084484,
+    "samples": 209920,
+    "wav": "/root/voice-infer-platform/tests/audio/stability_2_default.wav"
+  },
+  {
+    "name": "stability_3",
+    "voice_id": "default",
+    "ttfa_s": 0.099,
+    "total_s": 7.98,
+    "duration_s": 13.12,
+    "rtf": 0.608,
+    "rms": 0.084484,
+    "samples": 209920,
+    "wav": "/root/voice-infer-platform/tests/audio/stability_3_default.wav"
+  },
+  {
+    "name": "long_continuous",
+    "voice_id": "default",
+    "ttfa_s": 0.114,
+    "total_s": 30.901,
+    "duration_s": 50.24,
+    "rtf": 0.615,
+    "rms": 0.115359,
+    "samples": 803840,
+    "wav": "/root/voice-infer-platform/tests/audio/long_continuous_default.wav"
+  }
+]

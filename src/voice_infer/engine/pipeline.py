@@ -17,11 +17,15 @@ class PipelineEngine:
         self._history: dict[str, list[dict]] = {}
         self._epoch: dict[str, int] = {}
         self._locks: dict[str, asyncio.Lock] = {}
+        self._cancel_events: dict[str, asyncio.Event] = {}
 
     def _is_stale(self, sid, epoch): return self._epoch.get(sid, 0) != epoch
 
     async def cancel(self, sid):
         self._epoch[sid] = self._epoch.get(sid, 0) + 1
+        # 通知 TTS 停止当前生成
+        ev = self._cancel_events.get(sid)
+        if ev: ev.set()
         await self.vad.reset(sid)
 
     async def process(self, audio_chunk: bytes, session_id: str,
@@ -34,6 +38,10 @@ class PipelineEngine:
             epoch = self._epoch.get(session_id, 0)
             segment = segments[0]
 
+        # 新建本轮 cancel event
+        cancel_ev = asyncio.Event()
+        self._cancel_events[session_id] = cancel_ev
+
         try:
             if self._is_stale(session_id, epoch): return
             t = await self.asr.transcribe(segment)
@@ -42,7 +50,7 @@ class PipelineEngine:
 
             history = self._history.get(session_id, [])
             full, turn_id = "", uuid.uuid4().hex[:12]
-            audio_started = False  # 整轮只发一次 audio_start
+            audio_started = False
 
             async for r in self.llm.generate(
                 user_text=t.text.strip(), session_id=session_id,
@@ -51,18 +59,18 @@ class PipelineEngine:
                 if self._is_stale(session_id, epoch): return
                 yield r; full += r.text
 
-                async for c in self.tts.synthesize(text=r.text, voice_id=voice_id, session_id=session_id, turn_id=turn_id):
+                async for c in self.tts.synthesize(
+                    text=r.text, voice_id=voice_id, session_id=session_id,
+                    turn_id=turn_id, cancelled=cancel_ev,
+                ):
                     if self._is_stale(session_id, epoch): return
-                    # 只在第一句的第一个 chunk 发 audio_start
                     if c.is_first and not audio_started:
                         audio_started = True
                         yield AudioChunk(session_id=session_id, turn_id=turn_id, chunk_id=0, audio=b"", sample_rate=16000, is_first=True, is_final=False)
-                    # 抑制每句的 is_first，避免前端重置播放队列
                     yield AudioChunk(session_id=c.session_id, turn_id=turn_id, chunk_id=c.chunk_id,
                                      audio=c.audio, sample_rate=c.sample_rate,
                                      is_first=False, is_final=c.is_final)
 
-            # 整轮最后发 audio_end
             if audio_started:
                 yield AudioChunk(session_id=session_id, turn_id=turn_id, chunk_id=9999, audio=b"", sample_rate=16000, is_first=False, is_final=True)
 
@@ -73,8 +81,9 @@ class PipelineEngine:
                 self._history[session_id] = history
 
         finally:
-            pass
+            self._cancel_events.pop(session_id, None)
 
     async def reset_session(self, sid):
         self._history.pop(sid, None); self._epoch.pop(sid, None)
+        self._cancel_events.pop(sid, None)
         await self.vad.reset(sid)

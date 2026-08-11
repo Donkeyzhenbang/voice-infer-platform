@@ -153,7 +153,8 @@ def create_app(config=None):
     llm = DeepSeekLLM(lc.model, lc.base_url, api_key_env=lc.api_key_env, max_tokens=lc.max_tokens, temperature=lc.temperature, system_prompt=lc.system_prompt)
     tc = pc.tts; logger.info("Load TTS...")
     voices = {vid: VoiceSpec(vid, _abs(vc.ref_wav), vc.ref_text) for vid, vc in tc.voices.items()}
-    tts = VoxCPM2TTS(tc.model, tc.device, tc.sample_rate, tc.cfg_value, tc.inference_timesteps, voices=voices)
+    tts = VoxCPM2TTS(tc.model, tc.device, tc.sample_rate, tc.cfg_value, tc.inference_timesteps,
+                     atempo_rate=tc.atempo_rate, voices=voices)
     tts.load_model()
     pipeline = PipelineEngine(vad, asr, llm, tts); sessions = SessionManager()
     voice_mgr = VoiceManager(tts, config)
