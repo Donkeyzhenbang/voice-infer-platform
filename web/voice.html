@@ -31,27 +31,72 @@ h1{font-size:20px;font-weight:600}
 
 <script>
 const btn=document.getElementById("recBtn"),hint=document.getElementById("hint"),result=document.getElementById("result");
-let recording=false,chunks=[],recorder=null,stream=null;
-const SR=16000;
+let recording=false,recorder=null,stream=null;
+const SR=16000, MAX_DURATION=15;
 
 btn.onclick=()=>recording?stop():start();
+
 async function start(){
   try{
-    stream=await navigator.mediaDevices.getUserMedia({audio:{sampleRate:SR,channelCount:1,echoCancellation:!0,noiseSuppression:!1}});
-    chunks=[];recording=true;btn.classList.add("recording");hint.textContent="🔴 正在录音...请朗读上方文字";
+    // 开启浏览器内置降噪 + 回声消除 + 自动增益
+    stream=await navigator.mediaDevices.getUserMedia({
+      audio:{
+        sampleRate:SR, channelCount:1,
+        echoCancellation:true,
+        noiseSuppression:true,       // ← 浏览器降噪
+        autoGainControl:true,        // ← 自动增益
+      }
+    });
+    recording=true; btn.classList.add("recording"); hint.textContent="🔴 正在录音...请朗读上方文字（保持音量适中）";
     recorder=new MediaRecorder(stream,{mimeType:"audio/webm"});
+    // 每秒检查音量（提示用户）
+    let peakDetect=setInterval(()=>{},1000);  // placeholder
     recorder.ondataavailable=e=>{if(e.data.size>0)chunks.push(e.data);};
-    recorder.onstop=async()=>{
-      stream.getTracks().forEach(t=>t.stop());btn.classList.remove("recording");
-      hint.textContent="处理中...";result.innerHTML="";
+    recorder.onstop=async ()=>{
+      stream.getTracks().forEach(t=>t.stop()); btn.classList.remove("recording");
+      hint.textContent="处理中（降噪+标准化）..."; result.innerHTML="";
+
+      // 1. 解码 WebM → float32 PCM
       const blob=new Blob(chunks,{type:"audio/webm"});
       const ab=await blob.arrayBuffer();
       const actx=new(window.AudioContext||window.webkitAudioContext)({sampleRate:SR});
       const abuf=await actx.decodeAudioData(ab);
-      const pcm=abuf.getChannelData(0);
+      let pcm=abuf.getChannelData(0);
+
+      // 2. 噪声门：低于 RMS 峰值 -30dB 的片段静音
+      const frameLen=Math.floor(SR*0.02); // 20ms 帧
+      let maxRms=0;
+      for(let i=0;i<pcm.length;i+=frameLen){
+        let sum=0, n=Math.min(frameLen,pcm.length-i);
+        for(let j=0;j<n;j++) sum+=pcm[i+j]*pcm[i+j];
+        maxRms=Math.max(maxRms,Math.sqrt(sum/n));
+      }
+      const gateThresh=maxRms*0.0316; // -30dB 阈值
+      if(maxRms<0.01){
+        hint.textContent="❌ 录音音量过低，请靠近麦克风重试"; return;
+      }
+      for(let i=0;i<pcm.length;i+=frameLen){
+        let sum=0, n=Math.min(frameLen,pcm.length-i);
+        for(let j=0;j<n;j++) sum+=pcm[i+j]*pcm[i+j];
+        if(Math.sqrt(sum/n)<gateThresh) for(let j=0;j<n;j++) pcm[i+j]=0;
+      }
+
+      // 3. 裁剪首尾静音
+      let head=0, tail=pcm.length-1;
+      while(head<pcm.length&&Math.abs(pcm[head])<gateThresh*2) head++;
+      while(tail>0&&Math.abs(pcm[tail])<gateThresh*2) tail--;
+      if(tail<=head+SR*0.5){hint.textContent="❌ 有效语音太短，请重新录制"; return;}
+      pcm=pcm.slice(Math.max(0,head-400),Math.min(pcm.length,tail+400));
+
+      // 4. 峰值归一化到 -3dB（0.708）
+      let peak=0.001;
+      for(let i=0;i<pcm.length;i++) peak=Math.max(peak,Math.abs(pcm[i]));
+      const normGain=0.708/peak;
+      for(let i=0;i<pcm.length;i++) pcm[i]=Math.max(-1,Math.min(1,pcm[i]*normGain));
+
+      // 5. 转 int16 → WAV
       const i16=new Int16Array(pcm.length);
-      for(let i=0;i<pcm.length;i++)i16[i]=Math.max(-32768,Math.min(32767,Math.round(pcm[i]*32767)));
-      // 封装 WAV
+      for(let i=0;i<pcm.length;i++) i16[i]=Math.max(-32768,Math.min(32767,Math.round(pcm[i]*32767)));
       const buf=new ArrayBuffer(44+i16.length*2),v=new DataView(buf);
       "RIFF".split("").forEach((c,i)=>v.setUint8(i,c.charCodeAt(0)));v.setUint32(4,36+i16.length*2,true);
       "WAVEfmt ".split("").forEach((c,i)=>v.setUint8(8+i,c.charCodeAt(0)));v.setUint32(16,16,true);
@@ -59,7 +104,8 @@ async function start(){
       v.setUint32(28,SR*2,true);v.setUint16(32,2,true);v.setUint16(34,16,true);
       "data".split("").forEach((c,i)=>v.setUint8(36+i,c.charCodeAt(0)));v.setUint32(40,i16.length*2,true);
       for(let i=0;i<i16.length;i++)v.setInt16(44+i*2,i16[i],true);
-      // 上传
+
+      // 6. 上传
       const form=new FormData();form.append("file",new Blob([buf],{type:"audio/wav"}),"voice.wav");
       form.append("voice_id","my_voice");form.append("ref_text","今天天气真好，我想出去走走。阳光明媚，微风轻拂，春天真的来了。");
       try{
@@ -70,11 +116,10 @@ async function start(){
       }catch(e){result.innerHTML='<span class="error">❌ 上传失败: '+e.message+'</span>';hint.textContent="失败，请重试";}
     };
     recorder.start();
-    // 自动在 15 秒后停止
-    setTimeout(()=>{if(recording)recorder.stop();},15000);
+    setTimeout(()=>{if(recording)recorder.stop();},MAX_DURATION*1000);
   }catch(e){hint.textContent="麦克风权限未授予: "+e.message;}
 }
-function stop(){recording=false;if(recorder)recorder.stop();}
+function stop(){recording=false;if(recorder&&recorder.state!=="inactive")recorder.stop();}
 </script>
 </body>
 </html>

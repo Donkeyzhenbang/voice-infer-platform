@@ -71,11 +71,13 @@ class VoxCPM2TTS(TTSEngine):
                     prompt_text=ref_text,
                     prompt_wav_path=ref_wav,
                     reference_wav_path=ref_wav,
+                    trim_silence_vad=True,  # VAD 裁切首尾静音
                 )
             else:
                 # 仅音色克隆
                 cache = self._model.tts_model.build_prompt_cache(
                     reference_wav_path=ref_wav,
+                    trim_silence_vad=True,
                 )
             self.voice_prompts[spec.voice_id] = cache
             logger.info("Voice '%s' encoded to GPU cache", spec.voice_id)
