@@ -100,17 +100,23 @@ function connect(){
   ws.onclose=()=>{setStatus("off");setTimeout(connect,2000);};ws.onerror=()=>ws.close();
 }
 
-let aq=[],ap=false;
-function resetAudio(){aq=[];ap=false;}
+let aq=[],ap=false,_nextT=0;
+function resetAudio(){aq=[];ap=false;_nextT=0;}
 function playChunk(d){aq.push(d);if(!ap)drain();}
-function drain(){if(!aq.length){ap=false;return;}ap=true;playPCM(aq.shift()).then(drain);}
-async function playPCM(d){
+function drain(){
+  if(!aq.length){ap=false;return;}
+  ap=true;
   if(!audioCtx)audioCtx=new(window.AudioContext||window.webkitAudioContext)({sampleRate:SR});
+  // 对齐调度时间：首块立即播，后续块接在上块末尾
+  if(_nextT<audioCtx.currentTime) _nextT=audioCtx.currentTime;
+  const d=aq.shift();
   const f=new Float32Array(d.length/2),v=new DataView(d.buffer,d.byteOffset,d.byteLength);
   for(let i=0;i<f.length;i++)f[i]=v.getInt16(i*2,!0)/32768;
   const b=audioCtx.createBuffer(1,f.length,SR);b.getChannelData(0).set(f);
   const s=audioCtx.createBufferSource();s.buffer=b;s.connect(audioCtx.destination);
-  s.start();return new Promise(r=>{s.onended=r;});
+  const t0=_nextT, dur=f.length/SR;
+  s.start(t0);_nextT=t0+dur;
+  s.onended=()=>{if(aq.length)drain();else{ap=false;_nextT=0;}};
 }
 
 micBtn.onclick=()=>listening?stopMic():startMic();
@@ -119,7 +125,7 @@ stopBtn.onclick=()=>{if(ws&&ws.readyState===1)ws.send(JSON.stringify({type:"inte
 async function startMic(){
   try{
     stream=await navigator.mediaDevices.getUserMedia({audio:{sampleRate:SR,channelCount:1,echoCancellation:!0,noiseSuppression:!0}});
-    audioCtx=new(window.AudioContext||window.webkitAudioContext)({sampleRate:SR});
+    audioCtx=audioCtx||new(window.AudioContext||window.webkitAudioContext)({sampleRate:SR});
     const src=audioCtx.createMediaStreamSource(stream),proc=audioCtx.createScriptProcessor(4096,1,1);
     src.connect(proc);proc.connect(audioCtx.destination);
     proc.onaudioprocess=e=>{
