@@ -143,10 +143,15 @@ class VoxCPM2TTS(TTSEngine):
     def _encode_voice(self, spec: VoiceSpec):
         """预编码参考音频为 GPU latent features。
 
-        预处理：对 ref.wav 做峰值归一化到 -1dB（避免爆音），
-        再调 build_prompt_cache（VAD 裁切静音）。
+        default 音色的 ref.wav 是机器生成的，跳过编码——回退 zero-shot 干净输出。
+        只有真人录制的声音才走 Ultimate Cloning。
         """
         try:
+            # default 音色的参考音频是机器生成的，不编码（避免 artifacts 反馈循环）
+            if spec.voice_id == DEFAULT_VOICE:
+                logger.info("Skipping '%s' voice encoding (machine-generated ref, using zero-shot)", DEFAULT_VOICE)
+                return
+
             ref_wav = spec.ref_wav
             ref_text = spec.ref_text.strip()
             logger.info("Encoding voice '%s': ref=%s", spec.voice_id, ref_wav)
