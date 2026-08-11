@@ -1,4 +1,4 @@
-"""Pipeline：整轮音频 start/end 只发一次，避免多句 TTS 互相截断。"""
+"""Pipeline：LLM 流式输出 → 后台 TTS 并发生成，首音延迟最小化。"""
 
 from __future__ import annotations
 
@@ -23,7 +23,6 @@ class PipelineEngine:
 
     async def cancel(self, sid):
         self._epoch[sid] = self._epoch.get(sid, 0) + 1
-        # 通知 TTS 停止当前生成
         ev = self._cancel_events.get(sid)
         if ev: ev.set()
         await self.vad.reset(sid)
@@ -38,7 +37,6 @@ class PipelineEngine:
             epoch = self._epoch.get(session_id, 0)
             segment = segments[0]
 
-        # 新建本轮 cancel event
         cancel_ev = asyncio.Event()
         self._cancel_events[session_id] = cancel_ev
 
@@ -52,6 +50,25 @@ class PipelineEngine:
             full, turn_id = "", uuid.uuid4().hex[:12]
             audio_started = False
 
+            # 后台 TTS 队列：LLM 每出一句立即异步提交
+            tts_out: asyncio.Queue = asyncio.Queue(maxsize=256)
+
+            async def _run_tts(text: str, seq: int):
+                try:
+                    async for c in self.tts.synthesize(
+                        text=text, voice_id=voice_id, session_id=session_id,
+                        turn_id=turn_id, cancelled=cancel_ev,
+                    ):
+                        if self._is_stale(session_id, epoch): return
+                        await tts_out.put((seq, c))
+                except Exception as e:
+                    logger.error("TTS bg error: %s", e)
+
+            tts_tasks = []
+            seq = 0
+            pending: dict[int, list] = {}
+            next_out = 0
+
             async for r in self.llm.generate(
                 user_text=t.text.strip(), session_id=session_id,
                 history=history, instructions=instructions,
@@ -59,17 +76,47 @@ class PipelineEngine:
                 if self._is_stale(session_id, epoch): return
                 yield r; full += r.text
 
-                async for c in self.tts.synthesize(
-                    text=r.text, voice_id=voice_id, session_id=session_id,
-                    turn_id=turn_id, cancelled=cancel_ev,
-                ):
+                # 后台提交 TTS（不阻塞 LLM）
+                tts_tasks.append(asyncio.create_task(_run_tts(r.text, seq)))
+                seq += 1
+
+                # 非阻塞收 TTS 已有输出
+                while True:
+                    try:
+                        s, c = tts_out.get_nowait()
+                    except asyncio.QueueEmpty:
+                        break
+                    pending.setdefault(s, []).append(c)
+                # 按序输出
+                while next_out in pending:
+                    for pc in pending.pop(next_out):
+                        if self._is_stale(session_id, epoch): return
+                        if pc.is_first and not audio_started:
+                            audio_started = True
+                            yield AudioChunk(session_id=session_id, turn_id=turn_id, chunk_id=0, audio=b"", sample_rate=16000, is_first=True, is_final=False)
+                        yield AudioChunk(session_id=pc.session_id, turn_id=turn_id, chunk_id=pc.chunk_id,
+                                         audio=pc.audio, sample_rate=pc.sample_rate,
+                                         is_first=False, is_final=pc.is_final)
+                    next_out += 1
+
+            # LLM 结束，等所有 TTS 完成
+            if tts_tasks:
+                await asyncio.gather(*tts_tasks, return_exceptions=True)
+
+            # 收尾
+            while not tts_out.empty():
+                s, c = tts_out.get_nowait()
+                pending.setdefault(s, []).append(c)
+            while next_out in pending:
+                for pc in pending.pop(next_out):
                     if self._is_stale(session_id, epoch): return
-                    if c.is_first and not audio_started:
+                    if pc.is_first and not audio_started:
                         audio_started = True
                         yield AudioChunk(session_id=session_id, turn_id=turn_id, chunk_id=0, audio=b"", sample_rate=16000, is_first=True, is_final=False)
-                    yield AudioChunk(session_id=c.session_id, turn_id=turn_id, chunk_id=c.chunk_id,
-                                     audio=c.audio, sample_rate=c.sample_rate,
-                                     is_first=False, is_final=c.is_final)
+                    yield AudioChunk(session_id=pc.session_id, turn_id=turn_id, chunk_id=pc.chunk_id,
+                                     audio=pc.audio, sample_rate=pc.sample_rate,
+                                     is_first=False, is_final=pc.is_final)
+                next_out += 1
 
             if audio_started:
                 yield AudioChunk(session_id=session_id, turn_id=turn_id, chunk_id=9999, audio=b"", sample_rate=16000, is_first=False, is_final=True)
