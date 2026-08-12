@@ -39,8 +39,15 @@ tts:
       ref_wav: assets/default/ref.wav
       ref_text: assets/default/ref.txt
 
+# 参考 VoxEMW：persona id 统一绑定角色提示词、音色和数字人形象。
+personas:
+  default: dora
+  list:
+    dora: personas/dora.md
+    default: personas/default.md
+
 memory:
-  enabled: true
+  enabled: false  # 第一阶段先保证语音通话低延迟，长期记忆后续再开启
   embedder_model_path: /root/.cache/modelscope/models/BAAI--bge-m3/snapshots/master
   store_dir: data/memory
   top_k: 5

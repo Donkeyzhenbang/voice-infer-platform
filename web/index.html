@@ -2,7 +2,7 @@
 <html lang="zh-CN">
 <head>
 <meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">
-<title>Voice Infer Platform</title>
+<title>哆啦A梦语音通话</title>
 <style>
 *{margin:0;padding:0;box-sizing:border-box}
 body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"Helvetica Neue",sans-serif;background:#f5f5f7;color:#1d1d1f;height:100vh;display:flex;flex-direction:column}
@@ -47,8 +47,9 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"Helvetica N
 </head>
 <body>
 <div class="header">
-  <h1>🎙 Voice Infer</h1>
+  <h1>🔔 哆啦A梦语音通话</h1>
   <span class="badge" id="status">connecting</span>
+  <select class="voice-sel" id="personaSel" aria-label="选择角色"></select>
   <select class="voice-sel" id="voiceSel"></select>
   <span class="spacer"></span>
   <span class="nav"><a href="/voice">录制的音色</a></span>
@@ -68,13 +69,14 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"Helvetica N
   <span class="hint" id="hint">点击麦克风开始，直接说话</span>
 </div>
 <script src="/avatar.js"></script>
-<script src="/live2d-avatar.js"></script>
 <script src="/emotes.js"></script>
 <script>
 const micBtn=document.getElementById("micBtn"),stopBtn=document.getElementById("stopBtn");
 const convEl=document.getElementById("conversation"),statusEl=document.getElementById("status");
 const hintEl=document.getElementById("hint"),voiceSel=document.getElementById("voiceSel");
+const personaSel=document.getElementById("personaSel");
 let ws=null,audioCtx=null,stream=null,listening=false;const SR=16000;
+let personas=[],currentPersona="dora";
 
 // AudioWorklet nodes
 let micNode=null,playNode=null;
@@ -82,7 +84,8 @@ let workletReady=false;
 
 function addMsg(role,text){
   const d=document.createElement("div");d.className="msg "+role;
-  const l=document.createElement("div");l.className="label";l.textContent=role==="user"?"你":"AI";d.appendChild(l);
+  const persona=personas.find(p=>p.id===currentPersona);
+  const l=document.createElement("div");l.className="label";l.textContent=role==="user"?"你":(persona?.label||"哆啦A梦");d.appendChild(l);
   const s=document.createElement("span");s.textContent=text;d.appendChild(s);
   convEl.appendChild(d);convEl.scrollTop=convEl.scrollHeight;return d;
 }
@@ -90,14 +93,31 @@ let curAsst=null,curSpan=null;
 
 function setStatus(s){statusEl.textContent=s;statusEl.className="badge "+s;}
 
-function loadVoices(){
+function loadVoices(preferred){
   const cur=voiceSel.value;
   fetch("/api/voices").then(r=>r.json()).then(d=>{
     voiceSel.innerHTML="";d.voices.forEach(v=>{const o=document.createElement("option");o.value=v.id;o.textContent=v.id+(v.type==="builtin"?" (内置)":" (自定义)");voiceSel.appendChild(o);});
-    if(cur)voiceSel.value=cur;  // 保持之前选中的音色不丢失
+    const persona=personas.find(p=>p.id===currentPersona);
+    const target=preferred||cur||persona?.voice_id||"default";
+    if(target&&!Array.from(voiceSel.options).some(o=>o.value===target)){
+      const o=document.createElement("option");o.value=target;o.textContent=target+" (未配置，回退内置)";voiceSel.appendChild(o);
+    }
+    voiceSel.value=target;
   });
 }
 voiceSel.onchange=()=>{if(ws&&ws.readyState===1)ws.send(JSON.stringify({type:"voice_change",voice_id:voiceSel.value}));};
+personaSel.onchange=()=>{
+  currentPersona=personaSel.value;curAsst=null;resetAudio();
+  if(ws&&ws.readyState===1)ws.send(JSON.stringify({type:"persona_change",persona_id:currentPersona}));
+};
+
+async function loadPersonas(){
+  const r=await fetch("/api/personas"),data=await r.json();
+  personas=data.list||[];currentPersona=data.default||personas[0]?.id||"dora";
+  personaSel.innerHTML="";
+  personas.forEach(p=>{const o=document.createElement("option");o.value=p.id;o.textContent=p.name;personaSel.appendChild(o);});
+  personaSel.value=currentPersona;
+}
 
 function connect(){
   const p=location.protocol==="https:"?"wss:":"ws:";ws=new WebSocket(p+"//"+location.host+"/ws");ws.binaryType="arraybuffer";
@@ -106,6 +126,9 @@ function connect(){
     if(typeof e.data==="string"){
       const m=JSON.parse(e.data);
       switch(m.type){
+        case"session_ready":
+          currentPersona=m.persona_id||currentPersona;personaSel.value=currentPersona;loadVoices(m.voice_id);
+          if(m.greeting&&!convEl.children.length)addMsg("assistant",m.greeting);break;
         case"transcription":addMsg("user",m.text);curAsst=null;setStatus("thinking");hintEl.textContent=m.text;if(avatar)avatar.setState("listening");break;
         case"llm_token":
           if(!curAsst){curAsst=addMsg("assistant","");curSpan=curAsst.querySelector("span");}
@@ -113,11 +136,16 @@ function connect(){
           if(emotes)emotes.detect(m.text);break;
         case"audio_start":resetAudio();setStatus("speaking");stopBtn.style.display="";if(avatar)avatar.setState("speaking");break;
         case"audio_end":setStatus(listening?"listening":"ready");stopBtn.style.display="none";if(avatar)avatar.setState(listening?"listening":"idle");break;
-        case"persona_changed":case"voice_changed":loadVoices();break;
+        case"persona_changed":
+          currentPersona=m.persona_id;personaSel.value=currentPersona;loadVoices(m.voice_id);
+          curAsst=null;if(m.greeting)addMsg("assistant",m.greeting);break;
+        case"voice_changed":loadVoices(m.voice_id);break;
+        case"error":setStatus("off");hintEl.textContent=m.message||"服务暂时不可用";break;
       }
     }else{
-      playChunk(new Uint8Array(e.data));
-      if(avatar)avatar.feedAudio(e.data);  // 音频同步驱动口型
+      const pcm=new Uint8Array(e.data);
+      if(avatar)avatar.feedAudio(pcm);  // 转移 ArrayBuffer 前先驱动口型
+      playChunk(pcm);
     }
   };
   ws.onclose=()=>{setStatus("off");setTimeout(connect,2000);};ws.onerror=()=>ws.close();
@@ -165,27 +193,18 @@ function stopMic(){
   setStatus("ready");hintEl.textContent="点击麦克风开始";
 }
 document.addEventListener("keydown",e=>{if(e.code==="Space"&&e.target===document.body){e.preventDefault();micBtn.click();}});
-// 初始化数字人头像：优先 Live2D（CDN 猫模型），失败回退 Canvas
+// 第一阶段使用本地 Canvas 形象，避免外部 Live2D CDN 与角色不匹配。
 let avatar=null;
 const avatarCanvas=document.getElementById("avatar");
-const live2dRoot=document.getElementById("live2d-root");
 function initAvatar(){
-  if(window.Live2DAvatar){
-    avatar=new Live2DAvatar(avatarCanvas);
-    const modelUrl="https://model.hacxy.cn/cat-black/model.json"; // hijiki 黑猫
-    avatar.load(modelUrl).then(()=>{
-      live2dRoot.style.display="";avatarCanvas.style.display="none";
-    }).catch(()=>{
-      if(window.Avatar){avatar=new window.Avatar(avatarCanvas);avatar.start();}
-    });
-  }else if(window.Avatar){
+  if(window.Avatar){
     avatar=new window.Avatar(avatarCanvas);avatar.start();
+    avatar.setState("idle");
   }
-  avatar.setState("idle");
 }
 // 表情贴纸
 const emotes=window.Emotes?new Emotes():null;
 initAvatar();
-connect();
+loadPersonas().then(connect).catch(()=>{hintEl.textContent="角色配置加载失败";setStatus("off");});
 </script>
 </body>

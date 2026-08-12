@@ -1,3 +1,27 @@
+# 哆啦A梦语音通话（Avatar 分支第一阶段）
+
+当前已完成“先语音、后视频”的第一阶段：默认进入哆啦A梦人设，浏览器可直接语音对话、实时播放、口型联动并支持打断。
+
+角色配置参考 VoxEMW，使用统一 persona 注册表绑定：
+
+```text
+personas/dora.md → 人设提示词 + voice_id + 欢迎语
+assets/dora/     → 可选参考音频与逐字台词
+web/avatar.js    → 本地 Canvas 形象与音量驱动口型
+```
+
+## 快速启动
+
+1. 安装 Python 3.10+、CUDA 环境和 `ffmpeg`。
+2. 安装工程：`pip install -e .`
+3. 将 `.env.example` 复制为 `.env.local`，填写 `DEEPSEEK_API_KEY`。
+4. 确认 `configs/pipeline.yaml` 中 VoxCPM2 模型路径在本机存在。
+5. 启动：`python -m voice_infer.server.app`，访问 `http://localhost:8000`。
+
+不放角色参考音频也能运行，此时自动使用内置音色。要启用专属音色，请把有权使用的 `ref.wav` 和对应逐字 `ref.txt` 放入 `assets/dora/` 后重启。详细要求见 `assets/dora/README.md`。
+
+> 本项目是非官方技术演示。角色名称及相关权利归其权利人所有，请勿分发未获授权的角色音频或图像素材。
+
 ## 语音服务平台模型设计
 
 单进程全链路 Pipeline：`VAD(Silero) → ASR(SenseVoiceSmall) → LLM(DeepSeek v4-flash) → TTS(VoxCPM2)`，FastAPI + WebSocket 双队列架构。

@@ -54,6 +54,13 @@ class TTSConfig(BaseModel):
     voices: dict[str, TTSVoiceConfig] = {}
 
 
+class PersonasConfig(BaseModel):
+    """角色注册表：persona id 同时绑定提示词、音色与形象。"""
+
+    default: str = "default"
+    list: dict[str, str] = {}
+
+
 class MemoryConfig(BaseModel):
     enabled: bool = False
     embedder_model_path: str = ""
@@ -74,6 +81,7 @@ class PipelineConfig(BaseModel):
     asr: ASRConfig = ASRConfig()
     llm: LLMConfig = LLMConfig()
     tts: TTSConfig = TTSConfig()
+    personas: PersonasConfig = PersonasConfig()
     memory: MemoryConfig = MemoryConfig()
     knowledge: KnowledgeConfig = KnowledgeConfig()
 

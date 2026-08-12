@@ -33,11 +33,13 @@ class SessionManager:
     def get(self, session_id):
         return self._sessions.get(session_id)
 
-    def update_persona(self, session_id, persona_id, persona_text):
+    def update_persona(self, session_id, persona_id, persona_text, voice_id=None):
         s = self._sessions.get(session_id)
         if s:
             s.persona_id = persona_id
             s.persona_text = persona_text
+            if voice_id:
+                s.voice_id = voice_id
 
     def update_voice(self, session_id, voice_id):
         s = self._sessions.get(session_id)

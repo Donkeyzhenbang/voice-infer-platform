@@ -1,6 +1,10 @@
 """FastAPI 入口：双队列 WS 架构。"""
 
-import nltk as _nltk; _nltk.download = lambda *_a, **_kw: None
+try:
+    import nltk as _nltk
+    _nltk.download = lambda *_a, **_kw: None
+except ImportError:
+    _nltk = None
 
 import asyncio, json, logging, os, uuid
 from pathlib import Path
@@ -16,7 +20,7 @@ from voice_infer.engine.llm.deepseek import DeepSeekLLM
 from voice_infer.engine.pipeline import PipelineEngine
 from voice_infer.engine.tts.voxcpm2 import VoxCPM2TTS, VoiceSpec
 from voice_infer.engine.vad.silero_vad import SileroVAD
-from voice_infer.server.persona import load_persona
+from voice_infer.server.persona import load_persona_registry
 from voice_infer.server.session import SessionManager
 from voice_infer.memory.store import create_memory_store
 
@@ -33,7 +37,9 @@ class VoiceManager:
             if d.is_dir() and (d / "ref.wav").is_file():
                 vid = d.name
                 if vid not in self.tts.voices:
-                    self.tts.register_voice(VoiceSpec(vid, str(d / "ref.wav"), (d / "ref.txt").read_text("utf-8").strip()))
+                    text_file = d / "ref.txt"
+                    ref_text = text_file.read_text("utf-8").strip() if text_file.is_file() else ""
+                    self.tts.register_voice(VoiceSpec(vid, str(d / "ref.wav"), ref_text))
 
     def list_voices(self): return self.tts.list_voices()
 
@@ -47,11 +53,14 @@ class VoiceManager:
         return True
 
 
-async def _ws_handler(ws, pipeline, sessions, personas, voice_mgr):
+async def _ws_handler(ws, pipeline, sessions, personas, default_persona, voice_mgr):
     sid = uuid.uuid4().hex[:16]
-    dp = personas.get("default", list(personas.values())[0])
-    s = sessions.create(sid, "default", dp.get("text", ""), "default")
-    logger.info("WS: %s", sid[:8])
+    dp = personas[default_persona]
+    s = sessions.create(
+        sid, default_persona, dp.get("text", ""), dp.get("voice_id", "default")
+    )
+    pipeline._persona_id[sid] = default_persona
+    logger.info("WS: %s persona=%s voice=%s", sid[:8], s.persona_id, s.voice_id)
 
     pcm_queue: asyncio.Queue = asyncio.Queue(maxsize=64)   # receiver → turn_worker
     out_queue: asyncio.Queue = asyncio.Queue(maxsize=128)   # turn_worker → sender
@@ -61,7 +70,12 @@ async def _ws_handler(ws, pipeline, sessions, personas, voice_mgr):
             while True:
                 raw = await ws.receive()
                 if "text" in raw:
-                    msg = json.loads(raw["text"]); t = msg.get("type", "")
+                    try:
+                        msg = json.loads(raw["text"])
+                    except json.JSONDecodeError:
+                        await out_queue.put(json.dumps({"type": "error", "message": "无效的控制消息"}))
+                        continue
+                    t = msg.get("type", "")
                     if t == "interrupt":
                         await pipeline.cancel(sid)
                         # 清空积压 PCM
@@ -69,11 +83,19 @@ async def _ws_handler(ws, pipeline, sessions, personas, voice_mgr):
                             try: pcm_queue.get_nowait()
                             except: break
                     elif t == "persona_change":
-                        pid = msg.get("persona_id", "default")
-                        p = personas.get(pid, dp)
-                        sessions.update_persona(sid, pid, p.get("text", ""))
+                        pid = str(msg.get("persona_id", ""))
+                        p = personas.get(pid)
+                        if p is None:
+                            await out_queue.put(json.dumps({"type": "error", "message": "未知角色"}))
+                            continue
+                        await pipeline.cancel(sid)
+                        voice_id = p.get("voice_id", "default")
+                        sessions.update_persona(sid, pid, p.get("text", ""), voice_id)
                         pipeline._persona_id[sid] = pid
-                        await out_queue.put(json.dumps({"type": "persona_changed", "persona_id": pid}))
+                        await out_queue.put(json.dumps({
+                            "type": "persona_changed", "persona_id": pid,
+                            "voice_id": voice_id, "greeting": p.get("greeting", ""),
+                        }))
                     elif t == "voice_change":
                         sessions.update_voice(sid, msg.get("voice_id", "default"))
                         await out_queue.put(json.dumps({"type": "voice_changed", "voice_id": msg.get("voice_id", "default")}))
@@ -115,10 +137,17 @@ async def _ws_handler(ws, pipeline, sessions, personas, voice_mgr):
                         if event.is_first: await out_queue.put(json.dumps({"type": "audio_start"}))
                         if event.audio: await out_queue.put(event.audio)
                         if event.is_final: await out_queue.put(json.dumps({"type": "audio_end"}))
-            except Exception as e:
-                logger.error("Turn error: %s", e)
+            except Exception:
+                logger.exception("Turn error")
+                await out_queue.put(json.dumps({
+                    "type": "error", "message": "本轮处理失败，请重试"
+                }))
 
     await ws.accept()
+    await out_queue.put(json.dumps({
+        "type": "session_ready", "persona_id": s.persona_id,
+        "voice_id": s.voice_id, "greeting": dp.get("greeting", ""),
+    }))
     tasks = [asyncio.create_task(receiver()), asyncio.create_task(sender()), asyncio.create_task(turn_worker())]
     try: await asyncio.gather(*tasks)
     except: pass
@@ -143,17 +172,37 @@ async def _ws_asgi(scope, receive, send, **kw):
 def _abs(p): path = Path(p); return str(path) if path.is_absolute() else str(REPO_ROOT / p)
 
 
+def _read_ref_text(value):
+    """TTS 配置兼容逐字台词文件路径或直接文本。"""
+    path = Path(str(value))
+    if not path.is_absolute():
+        path = REPO_ROOT / path
+    return path.read_text("utf-8").strip() if path.is_file() else str(value).strip()
+
+
 def create_app(config=None):
     if config is None:
         config = load_config(REPO_ROOT / "configs/pipeline.yaml", REPO_ROOT / "configs/server.yaml", REPO_ROOT / ".env.local", REPO_ROOT)
     setup_logging(config.server.log_level); pc = config.pipeline
+
+    default_persona, personas = load_persona_registry(REPO_ROOT, pc.personas)
 
     logger.info("Init VAD..."); vad = SileroVAD(pc.vad.min_silence_ms, pc.vad.min_speech_ms, pc.vad.speech_pad_ms)
     logger.info("Load ASR..."); asr = SenseVoiceASR(pc.asr.model, pc.asr.device, pc.asr.language); asr.load_model()
     lc = pc.llm; logger.info("Init LLM...")
     llm = DeepSeekLLM(lc.model, lc.base_url, api_key_env=lc.api_key_env, max_tokens=lc.max_tokens, temperature=lc.temperature, system_prompt=lc.system_prompt)
     tc = pc.tts; logger.info("Load TTS...")
-    voices = {vid: VoiceSpec(vid, _abs(vc.ref_wav), vc.ref_text) for vid, vc in tc.voices.items()}
+    voices = {
+        vid: VoiceSpec(vid, _abs(vc.ref_wav), _read_ref_text(vc.ref_text))
+        for vid, vc in tc.voices.items()
+    }
+    # 与 VoxEMW 一致：persona 可直接携带音色三件套，启动时统一建立 Prompt Cache。
+    for persona in personas.values():
+        if persona.get("ref_wav"):
+            voice_id = persona.get("voice_id") or persona["id"]
+            voices[voice_id] = VoiceSpec(
+                voice_id, persona["ref_wav"], persona.get("ref_text", "")
+            )
     tts = VoxCPM2TTS(tc.model, tc.device, tc.sample_rate, tc.cfg_value, tc.inference_timesteps,
                      atempo_rate=tc.atempo_rate, voices=voices)
     tts.load_model(optimize=tc.optimize)
@@ -168,15 +217,7 @@ def create_app(config=None):
     sessions = SessionManager()
     voice_mgr = VoiceManager(tts, config)
 
-    personas = {}
-    pd = REPO_ROOT / "personas"
-    if pd.is_dir():
-        for mf in pd.glob("*.md"):
-            try: p = load_persona(mf); personas[p["id"]] = p
-            except: pass
-    if not personas: personas["default"] = {"id":"default","name":"Default","label":"默认","text":"你是语音助手。用中文口语回复，简短自然。"}
-
-    app = FastAPI(title="Voice Infer", version="0.3.1")
+    app = FastAPI(title="哆啦A梦语音通话", version="0.4.0")
     app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
 
     @app.get("/")
@@ -215,7 +256,21 @@ def create_app(config=None):
 
     @app.get("/api/personas")
     async def api_p():
-        return {"default":"default","list":[{"id":pid,"name":p["name"],"label":p.get("label",p["name"])} for pid,p in personas.items()]}
+        available_voices = {v["id"] for v in voice_mgr.list_voices()}
+        return {
+            "default": default_persona,
+            "list": [
+                {
+                    "id": pid, "name": p["name"],
+                    "label": p.get("label", p["name"]),
+                    "voice_id": p.get("voice_id", "default"),
+                    "voice_ready": p.get("voice_id", "default") in available_voices,
+                    "has_image": bool(p.get("ref_image")),
+                    "greeting": p.get("greeting", ""),
+                }
+                for pid, p in personas.items()
+            ],
+        }
 
     @app.get("/api/voices")
     async def api_v(): return {"voices": voice_mgr.list_voices()}
@@ -233,10 +288,20 @@ def create_app(config=None):
     async def api_mem(): return {"enabled": memory.enabled}
 
     @app.get("/api/health")
-    async def health(): return {"status":"ok","sessions":sessions.active_count,"memory":memory.enabled}
+    async def health():
+        return {
+            "status":"ok", "sessions":sessions.active_count,
+            "memory":memory.enabled, "default_persona":default_persona,
+        }
 
     from functools import partial
-    app.add_middleware(_WSBypass, handler=partial(_ws_asgi, pipeline=pipeline, sessions=sessions, personas=personas, voice_mgr=voice_mgr))
+    app.add_middleware(
+        _WSBypass,
+        handler=partial(
+            _ws_asgi, pipeline=pipeline, sessions=sessions, personas=personas,
+            default_persona=default_persona, voice_mgr=voice_mgr,
+        ),
+    )
     logger.info("Ready (memory=%s)", memory.enabled)
     return app
 
