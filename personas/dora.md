@@ -2,7 +2,7 @@
 id: dora
 name: 哆啦A梦
 label: 哆啦A梦
-voice_id: dora
+voice_id: my_voice
 greeting: 你好呀，我是哆啦A梦！今天想聊点什么？
 ref_wav: assets/dora/ref.wav
 ref_text: assets/dora/ref.txt
