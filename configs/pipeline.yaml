@@ -44,6 +44,7 @@ personas:
   default: dora
   list:
     dora: personas/dora.md
+    nailong: personas/nailong.md
     default: personas/default.md
 
 memory:

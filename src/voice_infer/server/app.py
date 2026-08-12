@@ -213,9 +213,30 @@ def create_app(config=None):
         js = (REPO_ROOT / "web" / "emotes.js").read_text("utf-8")
         return Response(js, media_type="application/javascript")
 
+    @app.get("/image-avatar.js")
+    async def image_avatar_js():
+        from fastapi.responses import Response
+        js = (REPO_ROOT / "web" / "image-avatar.js").read_text("utf-8")
+        return Response(js, media_type="application/javascript")
+
+    @app.get("/assets/{path:path}")
+    async def assets(path: str):
+        from fastapi.responses import FileResponse
+        f = REPO_ROOT / "assets" / path
+        if f.is_file():
+            return FileResponse(f)
+        return {"error": "not found"}
+
     @app.get("/api/personas")
     async def api_p():
-        return {"default":"default","list":[{"id":pid,"name":p["name"],"label":p.get("label",p["name"])} for pid,p in personas.items()]}
+        items = []
+        for pid, p in personas.items():
+            item = {"id": pid, "name": p["name"], "label": p.get("label", p["name"])}
+            if p.get("ref_image"):
+                item["ref_image"] = p["ref_image"]
+                item["has_image"] = True
+            items.append(item)
+        return {"default": "default", "list": items}
 
     @app.get("/api/voices")
     async def api_v(): return {"voices": voice_mgr.list_voices()}
