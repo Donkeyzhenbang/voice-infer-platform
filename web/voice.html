@@ -32,7 +32,7 @@ h1{font-size:20px;font-weight:600}
 <script>
 const btn=document.getElementById("recBtn"),hint=document.getElementById("hint"),result=document.getElementById("result");
 let recording=false,chunks=[],recorder=null,stream=null;
-const SR=16000, MAX_DURATION=15;
+const SR=16000, MAX_DURATION=20;
 
 btn.onclick=()=>recording?stop():start();
 
@@ -47,7 +47,7 @@ async function start(){
         autoGainControl:true,        // ← 自动增益
       }
     });
-    recording=true; btn.classList.add("recording"); hint.textContent="🔴 正在录音...请朗读上方文字（保持音量适中）";
+    recording=true; btn.classList.add("recording"); hint.textContent="🔴 正在录音...自然说几句话即可（保持音量适中，建议 10-20 秒）";
     recorder=new MediaRecorder(stream,{mimeType:"audio/webm"});
     // 每秒检查音量（提示用户）
     let peakDetect=setInterval(()=>{},1000);  // placeholder
@@ -108,7 +108,7 @@ async function start(){
 
       // 6. 上传
       const form=new FormData();form.append("file",new Blob([buf],{type:"audio/wav"}),"voice.wav");
-      form.append("voice_id","my_voice");form.append("ref_text","今天天气真好，我想出去走走。阳光明媚，微风轻拂，春天真的来了。");
+      form.append("voice_id","my_voice");form.append("ref_text","");  // ref_text 由服务端 ASR 自动转写实际录音内容
       try{
         const r=await fetch("/api/voices/create",{method:"POST",body:form});
         const d=await r.json();

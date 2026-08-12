@@ -74,3 +74,35 @@ class SenseVoiceASR(ASREngine):
             emotion=emotion,
             is_final=True,
         )
+
+    async def transcribe_wav_bytes(self, wav_bytes: bytes) -> str:
+        """转写 WAV bytes → 文本（供音色克隆自动生成 ref_text）。
+
+        确保 ref_text 与实际录音逐字一致，避免 Ultimate Cloning
+        prompt 续写错位导致重复脚本台词。
+        """
+        import io
+        import wave as wave_mod
+        import numpy as np
+
+        await self._ensure_model()
+        try:
+            with wave_mod.open(io.BytesIO(wav_bytes), "rb") as w:
+                sr = w.getframerate()
+                raw = w.readframes(w.getnframes())
+            audio = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
+            if sr != 16000:
+                from voice_infer.common.audio import resample_audio
+                audio = resample_audio(audio, sr, 16000)
+
+            result = self._model.generate(
+                input=audio, language=self.language, use_itn=True,
+            )
+            text = ""
+            if result and len(result) > 0:
+                text = re.sub(r"<\|[^|]+\|>", "", result[0].get("text", "")).strip()
+            logger.info("Voice ref ASR: %r", text)
+            return text
+        except Exception as e:
+            logger.warning("Voice ref ASR failed: %s", e)
+            return ""
