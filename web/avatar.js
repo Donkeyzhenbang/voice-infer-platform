@@ -128,7 +128,7 @@ class Avatar {
     ctx.fill();
 
     // ── 眼睛（大圆，可眨） ──
-    const eyeOpen = 1 - this.blink * 0.9;
+    const eyeOpen = Math.max(0, Math.min(1, 1 - this.blink * 0.9));  // 钳制防负半径崩溃
     for (const side of [-1, 1]) {
       const ex = cx + side * r * 0.42;
       const ey = cy - r * 0.15;
