@@ -201,6 +201,18 @@ def create_app(config=None):
         js = (REPO_ROOT / "web" / "avatar.js").read_text("utf-8")
         return Response(js, media_type="application/javascript")
 
+    @app.get("/live2d-avatar.js")
+    async def live2d_avatar_js():
+        from fastapi.responses import Response
+        js = (REPO_ROOT / "web" / "live2d-avatar.js").read_text("utf-8")
+        return Response(js, media_type="application/javascript")
+
+    @app.get("/emotes.js")
+    async def emotes_js():
+        from fastapi.responses import Response
+        js = (REPO_ROOT / "web" / "emotes.js").read_text("utf-8")
+        return Response(js, media_type="application/javascript")
+
     @app.get("/api/personas")
     async def api_p():
         return {"default":"default","list":[{"id":pid,"name":p["name"],"label":p.get("label",p["name"])} for pid,p in personas.items()]}

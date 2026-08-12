@@ -35,8 +35,14 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"Helvetica N
 .voice-sel:focus{border-color:#007aff;box-shadow:0 0 0 3px rgba(0,122,255,.15)}
 .nav{font-size:12px;margin-left:auto}.nav a{color:#007aff;text-decoration:none}.nav a:hover{text-decoration:underline}
 .spacer{flex:1}
-.avatar-wrap{display:flex;justify-content:center;padding:10px 0 2px;flex-shrink:0}
+.avatar-wrap{display:flex;justify-content:center;padding:10px 0 2px;flex-shrink:0;position:relative}
 .avatar-wrap canvas{width:180px;height:180px;border-radius:16px;box-shadow:0 4px 16px rgba(0,122,255,.2)}
+#live2d-root{width:100%;max-width:420px;height:240px;overflow:hidden;border-radius:16px;background:linear-gradient(180deg,#bfe3ff,#e8f6ff)}
+#live2d-root canvas{display:block;margin:0 auto}
+.emote-pop{position:fixed;top:50%;left:50%;transform:translate(-50%,-50%);z-index:999;text-align:center;animation:emotePop 1.6s ease forwards;pointer-events:none}
+.emote-emoji{font-size:72px;filter:drop-shadow(0 4px 8px rgba(0,0,0,.2))}
+.emote-label{font-size:16px;font-weight:600;color:#fff;background:var(--emote-color,#ffe066);padding:4px 14px;border-radius:20px;margin-top:6px;box-shadow:0 2px 8px rgba(0,0,0,.15)}
+@keyframes emotePop{0%{opacity:0;transform:translate(-50%,-50%) scale(.3) rotate(-10deg)}15%{opacity:1;transform:translate(-50%,-50%) scale(1.2) rotate(5deg)}30%{transform:translate(-50%,-50%) scale(1)}80%{opacity:1}100%{opacity:0;transform:translate(-50%,-60%) scale(.9)}}
 </style>
 </head>
 <body>
@@ -48,6 +54,7 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"Helvetica N
   <span class="nav"><a href="/voice">录制的音色</a></span>
 </div>
 <div class="avatar-wrap">
+  <div id="live2d-root" style="display:none"></div>
   <canvas id="avatar" width="480" height="480"></canvas>
 </div>
 <div class="conversation" id="conversation"></div>
@@ -61,6 +68,8 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,"Helvetica N
   <span class="hint" id="hint">点击麦克风开始，直接说话</span>
 </div>
 <script src="/avatar.js"></script>
+<script src="/live2d-avatar.js"></script>
+<script src="/emotes.js"></script>
 <script>
 const micBtn=document.getElementById("micBtn"),stopBtn=document.getElementById("stopBtn");
 const convEl=document.getElementById("conversation"),statusEl=document.getElementById("status");
@@ -100,7 +109,8 @@ function connect(){
         case"transcription":addMsg("user",m.text);curAsst=null;setStatus("thinking");hintEl.textContent=m.text;if(avatar)avatar.setState("listening");break;
         case"llm_token":
           if(!curAsst){curAsst=addMsg("assistant","");curSpan=curAsst.querySelector("span");}
-          if(curSpan)curSpan.textContent+=m.text;convEl.scrollTop=convEl.scrollHeight;if(avatar)avatar.setState("thinking");break;
+          if(curSpan)curSpan.textContent+=m.text;convEl.scrollTop=convEl.scrollHeight;if(avatar)avatar.setState("thinking");
+          if(emotes)emotes.detect(m.text);break;
         case"audio_start":resetAudio();setStatus("speaking");stopBtn.style.display="";if(avatar)avatar.setState("speaking");break;
         case"audio_end":setStatus(listening?"listening":"ready");stopBtn.style.display="none";if(avatar)avatar.setState(listening?"listening":"idle");break;
         case"persona_changed":case"voice_changed":loadVoices();break;
@@ -155,10 +165,27 @@ function stopMic(){
   setStatus("ready");hintEl.textContent="点击麦克风开始";
 }
 document.addEventListener("keydown",e=>{if(e.code==="Space"&&e.target===document.body){e.preventDefault();micBtn.click();}});
-// 初始化数字人头像
+// 初始化数字人头像：优先 Live2D（CDN 猫模型），失败回退 Canvas
 let avatar=null;
 const avatarCanvas=document.getElementById("avatar");
-if(avatarCanvas&&window.Avatar){avatar=new Avatar(avatarCanvas);avatar.setState("idle");avatar.start();}
+const live2dRoot=document.getElementById("live2d-root");
+function initAvatar(){
+  if(window.Live2DAvatar){
+    avatar=new Live2DAvatar(avatarCanvas);
+    const modelUrl="https://model.hacxy.cn/cat-black/model.json"; // hijiki 黑猫
+    avatar.load(modelUrl).then(()=>{
+      live2dRoot.style.display="";avatarCanvas.style.display="none";
+    }).catch(()=>{
+      if(window.Avatar){avatar=new window.Avatar(avatarCanvas);avatar.start();}
+    });
+  }else if(window.Avatar){
+    avatar=new window.Avatar(avatarCanvas);avatar.start();
+  }
+  avatar.setState("idle");
+}
+// 表情贴纸
+const emotes=window.Emotes?new Emotes():null;
+initAvatar();
 connect();
 </script>
 </body>
